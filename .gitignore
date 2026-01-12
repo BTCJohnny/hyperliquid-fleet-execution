@@ -1,0 +1,55 @@
+# Environment Variables (CRITICAL - Contains wallet private keys)
+.env
+.env.local
+.env.*.local
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# Database Files (Shared - Not tracked in execution repo)
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Log Files
+*.log
+logs/
+*.err
+*.out
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# LaunchAgent outputs
+nohup.out
+
+# Temporary files
+*.tmp
+*.bak
+*.backup
+*.old
