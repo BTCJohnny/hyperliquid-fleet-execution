@@ -25,7 +25,6 @@ from hyperliquid.utils import constants
 class HyperLiquidTopGun:
     def __init__(self, bot_id, private_key, risk_per_trade=None, max_leverage=None, default_sl_dist=None, max_concurrent_positions=None):
         self.bot_id = bot_id
-        self.paused = False
         self.db_path = "/Users/johnny_main/Developer/data/signals/signals.db"
 
         # --- CONFIGURATION ---
@@ -98,22 +97,6 @@ class HyperLiquidTopGun:
         except Exception:
             return price
 
-    def check_controls(self, conn):
-        try:
-            c = conn.cursor()
-            c.execute("SELECT command FROM bot_controls WHERE bot_id = ? ORDER BY id DESC LIMIT 1", (self.bot_id,))
-            row = c.fetchone()
-            if row:
-                cmd = row[0].upper()
-                if cmd == "PAUSE" and not self.paused:
-                    self.paused = True
-                    logging.warning(f"[{self.bot_id}] ⏸️  PAUSED by Admin.")
-                elif cmd == "RESUME" and self.paused:
-                    self.paused = False
-                    logging.info(f"[{self.bot_id}] ▶️  RESUMED by Admin.")
-        except Exception as e:
-            logging.error(f"Control Check Error: {e}")
-
     def _check_order_status(self, result):
         """Parses API receipt. Ignores 'None' (success). Throws on 'error'."""
         if result is None: return
@@ -165,12 +148,6 @@ class HyperLiquidTopGun:
         
         while True:
             try:
-                # 1. Admin & Pause Check
-                self.check_controls(conn)
-                if self.paused:
-                    time.sleep(2)
-                    continue
-
                 c = conn.cursor()
 
                 # ==========================================================
@@ -403,12 +380,6 @@ class HyperLiquidTopGun:
         
         while True:
             try:
-                # 1. Admin & Pause Check
-                self.check_controls(conn)
-                if self.paused:
-                    time.sleep(2)
-                    continue
-
                 c = conn.cursor()
 
                 # ==========================================================
@@ -568,15 +539,26 @@ class HyperLiquidTopGun:
         """
         Continuous loop that monitors fills and triggers breakeven stop loss
         when TP1 is hit. Runs in a separate daemon thread.
+
+        Includes periodic full-scan (every 5 minutes) to catch any missed fills
+        due to API issues, service restarts, or timestamp gaps.
         """
         from datetime import datetime
 
         logging.info(f"[{self.bot_id}] Starting Fill Monitor Loop...")
 
         last_fill_check = 0  # Timestamp of last processed fill
+        full_scan_interval = 300  # 5 minutes - periodic full scan to catch missed fills
+        last_full_scan = time.time()
 
         while True:
             try:
+                # Periodic full scan to catch missed fills
+                if time.time() - last_full_scan > full_scan_interval:
+                    logging.info(f"[{self.bot_id}] 🔍 Fill Monitor: Running periodic full scan for missed fills")
+                    last_fill_check = 0  # Reset to re-process all available fills
+                    last_full_scan = time.time()
+
                 conn = sqlite3.connect(self.db_path, timeout=10)
                 c = conn.cursor()
 
@@ -611,6 +593,7 @@ class HyperLiquidTopGun:
     def _process_fill(self, fill, cursor):
         """
         Process a single fill and trigger breakeven logic if TP1 hit.
+        Also tracks position closures and calculates actual PnL.
 
         Fill structure:
         {
@@ -628,6 +611,15 @@ class HyperLiquidTopGun:
         oid = fill['oid']
         ticker = fill['coin']
         fill_time = datetime.fromtimestamp(fill['time'] / 1000).isoformat()
+        fill_dir = fill.get('dir', '')
+        closed_pnl = float(fill.get('closedPnl', 0.0))
+
+        # Debug logging for fill processing
+        logging.debug(f"[{self.bot_id}] Processing fill: {ticker} | OID={oid} | Dir={fill_dir} | Time={fill_time}")
+
+        # TRACK POSITION CLOSURES for actual PnL calculation
+        if 'Close' in fill_dir and closed_pnl != 0.0:
+            self._track_position_closure(ticker, fill, cursor)
 
         # Find signal associated with this order ID
         # IMPORTANT: Order IDs reset monthly on Hyperliquid, so filter by time to avoid collisions
@@ -649,6 +641,7 @@ class HyperLiquidTopGun:
         row = cursor.fetchone()
 
         if not row:
+            logging.debug(f"[{self.bot_id}] No signal match for fill: {ticker} OID={oid}")
             return  # Fill not related to any active position
 
         signal_id, direction, entry_price, sl_oid, sl_moved_to_be, position_size = row
@@ -686,8 +679,28 @@ class HyperLiquidTopGun:
     def _move_sl_to_breakeven(self, signal_id, ticker, direction, entry_price, old_sl_oid, position_size, cursor):
         """
         Cancel existing stop loss and place new one at breakeven (entry price).
+
+        Thread Safety: Uses atomic claim pattern to prevent race conditions between
+        Fill Monitor and Position Reconciliation threads.
         """
         try:
+            # CRITICAL: Atomic claim to prevent race condition between Fill Monitor and Reconciliation
+            # Attempt to claim this signal by setting sl_moved_to_be=1 only if it's still 0
+            cursor.execute("""
+                UPDATE signals
+                SET sl_moved_to_be = 1,
+                    notes = COALESCE(notes, '') || ' | BE SL in progress'
+                WHERE id = ? AND sl_moved_to_be = 0
+            """, (signal_id,))
+
+            if cursor.rowcount == 0:
+                # Another thread already claimed this signal, skip to avoid duplicate orders
+                logging.warning(f"[{self.bot_id}] ⚠️ BE already claimed for Signal {signal_id}, skipping (race condition avoided)")
+                return
+
+            # Commit immediately so other threads see sl_moved_to_be=1
+            cursor.connection.commit()
+
             is_long = direction.lower() in ['long', 'bullish']
 
             # Check if position still exists before modifying SL
@@ -742,16 +755,307 @@ class HyperLiquidTopGun:
 
             logging.info(f"   ✅ NEW BREAKEVEN SL @ {be_price_rounded} | Size: {remaining_size} | OID: {be_sl_oid}")
 
-            # STEP 3: Update database
+            # STEP 3: Update database with BE order ID (sl_moved_to_be already set at start)
             cursor.execute("""
                 UPDATE signals
-                SET sl_moved_to_be = 1,
-                    be_sl_order_id = ?,
+                SET be_sl_order_id = ?,
                     notes = COALESCE(notes, '') || ' | BE SL triggered after TP1'
                 WHERE id = ?
             """, (be_sl_oid, signal_id))
+            cursor.connection.commit()
 
             logging.info(f"[{self.bot_id}] 🛡️ BREAKEVEN ACTIVE for {ticker}")
 
         except Exception as e:
             logging.error(f"[{self.bot_id}] ❌ Breakeven SL failed: {e}")
+            # Reset flag so reconciliation can retry later
+            try:
+                cursor.execute("""
+                    UPDATE signals
+                    SET sl_moved_to_be = 0,
+                        notes = COALESCE(notes, '') || ' | BE SL failed: ' || ?
+                    WHERE id = ?
+                """, (str(e)[:100], signal_id))
+                cursor.connection.commit()
+            except Exception:
+                pass  # Don't mask original error
+
+    def _track_position_closure(self, ticker, fill, cursor):
+        """
+        Track position closures and calculate actual PnL from Hyperliquid fills.
+        Updates both entry signal and exit signal (if exists) with actual PnL.
+
+        Args:
+            ticker: Symbol (e.g., 'ETH')
+            fill: Fill data from Hyperliquid API
+            cursor: Database cursor
+        """
+        from datetime import datetime
+
+        try:
+            closed_pnl = float(fill.get('closedPnl', 0.0))
+            close_price = float(fill.get('px', 0.0))
+            close_size = float(fill.get('sz', 0.0))
+            fill_time = datetime.fromtimestamp(fill['time'] / 1000).isoformat()
+
+            if closed_pnl == 0.0 or close_size == 0.0:
+                return  # No meaningful PnL to track
+
+            # Find the most recent filled entry for this ticker
+            cursor.execute("""
+                SELECT id, entry_1, position_size_actual
+                FROM signals
+                WHERE bot_name = ?
+                AND symbol = ?
+                AND signal_type = 'entry'
+                AND status = 'filled'
+                ORDER BY created_at DESC
+                LIMIT 1
+            """, (self.bot_id, ticker))
+
+            entry_row = cursor.fetchone()
+
+            if not entry_row:
+                logging.warning(f"[{self.bot_id}] Position closed for {ticker} but no entry signal found")
+                return
+
+            signal_id, entry_price, position_size = entry_row
+            entry_price = float(entry_price)
+            position_size = float(position_size)
+
+            # Calculate PnL percentage
+            # PnL% = (closedPnl / (entry_price * position_size)) * 100
+            position_value = entry_price * position_size
+            if position_value > 0:
+                pnl_percent = (closed_pnl / position_value) * 100
+            else:
+                pnl_percent = 0.0
+
+            logging.info(f"[{self.bot_id}] 💰 POSITION CLOSED: {ticker} | "
+                        f"Entry: ${entry_price:.4f} | Close: ${close_price:.4f} | "
+                        f"Size: {position_size} | Actual PnL: {pnl_percent:.2f}% (${closed_pnl:.2f})")
+
+            # Update entry signal with actual PnL
+            cursor.execute("""
+                UPDATE signals
+                SET pnl_percent_actual = ?,
+                    notes = COALESCE(notes, '') || ' | Actual PnL: ' || ? || '%'
+                WHERE id = ?
+            """, (pnl_percent, f"{pnl_percent:.2f}", signal_id))
+
+            # Find and update corresponding exit signal (if exists)
+            cursor.execute("""
+                SELECT id
+                FROM signals
+                WHERE bot_name = ?
+                AND symbol = ?
+                AND signal_type = 'exit'
+                AND status IN ('executed', 'no_op')
+                AND created_at > (SELECT created_at FROM signals WHERE id = ?)
+                ORDER BY created_at ASC
+                LIMIT 1
+            """, (self.bot_id, ticker, signal_id))
+
+            exit_row = cursor.fetchone()
+
+            if exit_row:
+                exit_signal_id = exit_row[0]
+                cursor.execute("""
+                    UPDATE signals
+                    SET pnl_percent_actual = ?
+                    WHERE id = ?
+                """, (pnl_percent, exit_signal_id))
+                logging.info(f"   📝 Updated exit signal {exit_signal_id} with actual PnL")
+
+        except Exception as e:
+            logging.error(f"[{self.bot_id}] ❌ Failed to track position closure: {e}")
+
+    def run_position_reconciliation(self):
+        """
+        Continuous loop that reconciles database position state with actual Hyperliquid positions.
+        Runs every 60 seconds to detect and fix ghost positions (positions marked as 'filled'
+        in DB but no longer exist on Hyperliquid).
+
+        This catches all edge cases:
+        - System restarts (missed fills)
+        - API outages (Fill Monitor failures)
+        - Stop losses hit automatically
+        - Take profits filled
+        - Manual position closes on Hyperliquid
+        """
+        logging.info(f"[{self.bot_id}] Starting Position Reconciliation Loop...")
+
+        while True:
+            try:
+                conn = sqlite3.connect(self.db_path, timeout=10)
+                c = conn.cursor()
+
+                # Get all positions DB thinks are open (status='filled')
+                c.execute("""
+                    SELECT id, symbol, entry_1, position_size_actual
+                    FROM signals
+                    WHERE bot_name = ?
+                    AND signal_type = 'entry'
+                    AND status = 'filled'
+                    ORDER BY created_at DESC
+                """, (self.bot_id,))
+
+                db_positions = c.fetchall()
+
+                if not db_positions:
+                    conn.close()
+                    time.sleep(60)
+                    continue
+
+                # Get actual positions from Hyperliquid
+                user_state = self.info.user_state(self.account.address)
+                hl_positions = user_state.get("assetPositions", [])
+
+                # Build set of open tickers on Hyperliquid
+                open_tickers = set()
+                for pos in hl_positions:
+                    size = float(pos["position"]["szi"])
+                    if size != 0:
+                        open_tickers.add(pos["position"]["coin"])
+
+                # Check each DB position
+                for signal_id, ticker, entry_price, position_size in db_positions:
+                    ticker_clean = ticker.upper().replace("USDT", "").replace("PERP", "")
+
+                    # If position exists in DB but NOT on Hyperliquid, it's a ghost
+                    if ticker_clean not in open_tickers:
+                        logging.warning(f"[{self.bot_id}] 👻 GHOST POSITION DETECTED: {ticker_clean} (ID: {signal_id})")
+
+                        # Try to get PnL from recent fills
+                        pnl_info = self._get_pnl_from_fills(ticker_clean, entry_price, position_size)
+
+                        if pnl_info:
+                            pnl_percent, closed_pnl, close_price = pnl_info
+
+                            # Update with PnL data
+                            c.execute("""
+                                UPDATE signals
+                                SET status = 'closed',
+                                    pnl_percent_actual = ?,
+                                    notes = COALESCE(notes, '') || ' | Auto-closed by reconciliation. Actual PnL: ' || ? || '%'
+                                WHERE id = ?
+                            """, (pnl_percent, f"{pnl_percent:.2f}", signal_id))
+
+                            logging.info(f"   ✅ Reconciled {ticker_clean}: status='closed' | "
+                                       f"Entry: ${float(entry_price):.4f} | Close: ${close_price:.4f} | "
+                                       f"PnL: {pnl_percent:.2f}% (${closed_pnl:.2f})")
+                        else:
+                            # No PnL data available, just mark as closed
+                            c.execute("""
+                                UPDATE signals
+                                SET status = 'closed',
+                                    notes = COALESCE(notes, '') || ' | Auto-closed by reconciliation (PnL unavailable)'
+                                WHERE id = ?
+                            """, (signal_id,))
+
+                            logging.info(f"   ✅ Reconciled {ticker_clean}: status='closed' (PnL data unavailable)")
+
+                # Fallback: Check for missed TP1 fills that should have triggered breakeven
+                self._check_missed_breakeven(c)
+
+                conn.commit()
+                conn.close()
+
+                time.sleep(60)  # Run every 60 seconds
+
+            except Exception as e:
+                logging.error(f"[{self.bot_id}] Position Reconciliation Error: {e}")
+                time.sleep(60)
+
+    def _get_pnl_from_fills(self, ticker, entry_price, position_size):
+        """
+        Try to retrieve PnL data from recent fills for a closed position.
+
+        Args:
+            ticker: Symbol (e.g., 'ETH')
+            entry_price: Entry price from database
+            position_size: Position size from database
+
+        Returns:
+            Tuple of (pnl_percent, closed_pnl, close_price) or None if not found
+        """
+        try:
+            fills = self.info.user_fills(self.account.address)
+
+            # Look for closing fills for this ticker (most recent 100 fills)
+            for fill in reversed(fills[-100:]):
+                if fill['coin'] == ticker and 'Close' in fill.get('dir', ''):
+                    closed_pnl = float(fill.get('closedPnl', 0.0))
+                    close_price = float(fill.get('px', 0.0))
+
+                    if closed_pnl != 0.0:
+                        # Calculate PnL percentage
+                        position_value = float(entry_price) * float(position_size)
+                        if position_value > 0:
+                            pnl_percent = (closed_pnl / position_value) * 100
+                            return (pnl_percent, closed_pnl, close_price)
+
+            return None
+
+        except Exception as e:
+            logging.warning(f"[{self.bot_id}] Could not fetch PnL from fills for {ticker}: {e}")
+            return None
+
+    def _check_missed_breakeven(self, cursor):
+        """
+        Fallback check: Detect if any open positions missed their TP1 fill detection.
+        Query Hyperliquid fills to verify if TP1 was filled but BE not triggered.
+
+        This catches cases where the Fill Monitor missed the TP1 fill due to:
+        - API outages (502 errors)
+        - Service restarts
+        - Timestamp filtering gaps
+
+        Called from run_position_reconciliation() every 60 seconds.
+        """
+        enable_breakeven = os.getenv('ENABLE_BREAKEVEN_SL', 'True').lower() == 'true'
+        if not enable_breakeven:
+            return
+
+        # Query positions with status='filled' and sl_moved_to_be=0 (BE not yet triggered)
+        cursor.execute("""
+            SELECT id, symbol, direction, entry_1, order_id_tp1, order_id_sl, position_size_actual
+            FROM signals
+            WHERE bot_name = ?
+            AND status = 'filled'
+            AND sl_moved_to_be = 0
+            AND order_id_tp1 IS NOT NULL
+        """, (self.bot_id,))
+
+        positions_without_be = cursor.fetchall()
+
+        if not positions_without_be:
+            return
+
+        # Get recent fills from Hyperliquid
+        try:
+            fills = self.info.user_fills(self.account.address)
+        except Exception as e:
+            logging.warning(f"[{self.bot_id}] Could not fetch fills for BE check: {e}")
+            return
+
+        # Build set of filled order IDs for fast lookup
+        fill_oids = {f['oid'] for f in fills}
+
+        # Check each position for missed TP1 fill
+        for row in positions_without_be:
+            signal_id, ticker, direction, entry_price, tp1_oid, sl_oid, position_size = row
+
+            # Check if TP1 order was filled but we missed detecting it
+            if tp1_oid and tp1_oid in fill_oids:
+                logging.warning(f"[{self.bot_id}] 🔄 RECONCILIATION: Missed TP1 fill detected for {ticker} (Signal {signal_id})")
+                logging.info(f"[{self.bot_id}]    Triggering fallback breakeven for {ticker}...")
+
+                try:
+                    self._move_sl_to_breakeven(
+                        signal_id, ticker, direction, entry_price,
+                        sl_oid, position_size, cursor
+                    )
+                except Exception as e:
+                    logging.error(f"[{self.bot_id}] ❌ Fallback breakeven failed for {ticker} (Signal {signal_id}): {e}")
+                    # Continue processing other positions
