@@ -214,7 +214,7 @@ class HyperLiquidTopGun:
                 # 🚀 PRIORITY 2: CHECK FOR ENTRIES
                 # ==========================================================
                 query_entry = """
-                    SELECT id, symbol, direction, entry_1, target_1, target_2, target_3, target_4, target_5, stop_loss
+                    SELECT id, symbol, direction, entry_1, target_1, target_2, target_3, target_4, target_5, stop_loss, confidence_score
                     FROM signals
                     WHERE bot_name = ? AND status = 'pending' AND signal_type = 'entry'
                     ORDER BY created_at ASC LIMIT 1
@@ -223,7 +223,7 @@ class HyperLiquidTopGun:
                 row = c.fetchone()
 
                 if row:
-                    signal_id, ticker, direction, entry, tp1, tp2, tp3, tp4, tp5, sl = row
+                    signal_id, ticker, direction, entry, tp1, tp2, tp3, tp4, tp5, sl, confidence_score = row
                     ticker = ticker.upper().replace("USDT", "").replace("PERP", "")
                     logging.info(f"[{self.bot_id}] ENTRY SIGNAL: {ticker} ({direction})")
 
@@ -251,8 +251,15 @@ class HyperLiquidTopGun:
                         # --- SIZE CALCULATION ---
                         # (user_state already fetched above for position count check)
                         equity = float(user_state["marginSummary"]["accountValue"])
-                        
-                        risk_amt = equity * self.risk_per_trade
+
+                        # Use signal's confidence_score for risk if available (1/5 = 1%, 5/5 = 5%)
+                        # Otherwise fall back to bot's configured risk_per_trade
+                        if confidence_score and 1 <= confidence_score <= 5:
+                            signal_risk = confidence_score * 0.01  # Maps 1-5 to 1%-5%
+                            risk_amt = equity * signal_risk
+                            logging.info(f"   📊 Signal Size: {confidence_score}/5 → Risk: {confidence_score}%")
+                        else:
+                            risk_amt = equity * self.risk_per_trade
                         price_diff = abs(entry_px - stop_px)
                         
                         if price_diff == 0: raise ValueError("Invalid SL (Price == SL)")
@@ -429,7 +436,7 @@ class HyperLiquidTopGun:
                 # 🚀 PRIORITY 2: CHECK FOR ENTRIES
                 # ==========================================================
                 query_entry = """
-                    SELECT id, symbol, direction, entry_1, target_1, target_2, target_3, target_4, target_5, stop_loss
+                    SELECT id, symbol, direction, entry_1, target_1, target_2, target_3, target_4, target_5, stop_loss, confidence_score
                     FROM signals
                     WHERE bot_name = ? AND status = 'pending' AND signal_type = 'entry'
                     ORDER BY created_at ASC LIMIT 1
@@ -438,7 +445,7 @@ class HyperLiquidTopGun:
                 row = c.fetchone()
 
                 if row:
-                    signal_id, ticker, direction, entry, tp1, tp2, tp3, tp4, tp5, sl = row
+                    signal_id, ticker, direction, entry, tp1, tp2, tp3, tp4, tp5, sl, confidence_score = row
                     ticker = ticker.upper().replace("USDT", "").replace("PERP", "")
                     logging.info(f"[{self.bot_id}] ENTRY SIGNAL: {ticker} ({direction})")
 
@@ -466,8 +473,15 @@ class HyperLiquidTopGun:
                         # --- SIZE CALCULATION ---
                         # (user_state already fetched above for position count check)
                         equity = float(user_state["marginSummary"]["accountValue"])
-                        
-                        risk_amt = equity * self.risk_per_trade
+
+                        # Use signal's confidence_score for risk if available (1/5 = 1%, 5/5 = 5%)
+                        # Otherwise fall back to bot's configured risk_per_trade
+                        if confidence_score and 1 <= confidence_score <= 5:
+                            signal_risk = confidence_score * 0.01  # Maps 1-5 to 1%-5%
+                            risk_amt = equity * signal_risk
+                            logging.info(f"   📊 Signal Size: {confidence_score}/5 → Risk: {confidence_score}%")
+                        else:
+                            risk_amt = equity * self.risk_per_trade
                         price_diff = abs(entry_px - stop_px)
                         
                         if price_diff == 0: raise ValueError("Invalid SL (Price == SL)")
