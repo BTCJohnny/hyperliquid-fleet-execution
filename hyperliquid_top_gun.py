@@ -23,7 +23,7 @@ from hyperliquid.exchange import Exchange
 from hyperliquid.utils import constants
 
 class HyperLiquidTopGun:
-    def __init__(self, bot_id, private_key, risk_per_trade=None, max_leverage=None, default_sl_dist=None, max_concurrent_positions=None):
+    def __init__(self, bot_id, private_key, risk_per_trade=None, max_leverage=None, default_sl_dist=None, max_concurrent_positions=None, allowed_directions=None):
         self.bot_id = bot_id
         self.db_path = "/Users/johnny_main/Developer/data/signals/signals.db"
 
@@ -39,14 +39,21 @@ class HyperLiquidTopGun:
 
         env_max_pos = os.getenv("MAX_CONCURRENT_POSITIONS")
         self.max_concurrent_positions = max_concurrent_positions if max_concurrent_positions is not None else (int(env_max_pos) if env_max_pos else 3)
-        
+
+        # MANDATORY SAFETY LIMIT: Maximum allowed stop loss distance (10%)
+        # This is a hardcoded non-negotiable limit - signals with wider SL will be capped
+        self.max_sl_distance = 0.10  # 10% - ensures downside protection even if bot crashes
+
+        # Direction filter: "both" (default), "long", or "short"
+        self.allowed_directions = (allowed_directions or "both").lower()
+
         # --- CONNECTION & METADATA ---
         try:
             self.account = Account.from_key(private_key)
             is_mainnet = os.getenv("IS_MAINNET") == "True"
             node_url = constants.MAINNET_API_URL if is_mainnet else constants.TESTNET_API_URL
             
-            logging.info(f"[{self.bot_id}] Connecting... (Risk: {self.risk_per_trade*100}%, Max Lev: {self.max_leverage}x, Max Positions: {self.max_concurrent_positions})")
+            logging.info(f"[{self.bot_id}] Connecting... (Risk: {self.risk_per_trade*100}%, Max Lev: {self.max_leverage}x, Max Pos: {self.max_concurrent_positions}, Directions: {self.allowed_directions})")
             
             self.info = Info(node_url, skip_ws=True)
             self.exchange = Exchange(self.account, node_url)
@@ -96,6 +103,17 @@ class HyperLiquidTopGun:
             
         except Exception:
             return price
+
+    def _is_direction_allowed(self, direction: str) -> bool:
+        """Check if the signal direction is allowed by this bot's config."""
+        if self.allowed_directions == "both":
+            return True
+        direction_lower = direction.lower()
+        if self.allowed_directions == "long":
+            return direction_lower in ("long", "bullish")
+        elif self.allowed_directions == "short":
+            return direction_lower in ("short", "bearish")
+        return True  # Default to allowing if unknown config
 
     def _check_order_status(self, result):
         """Parses API receipt. Ignores 'None' (success). Throws on 'error'."""
@@ -227,9 +245,23 @@ class HyperLiquidTopGun:
                     ticker = ticker.upper().replace("USDT", "").replace("PERP", "")
                     logging.info(f"[{self.bot_id}] ENTRY SIGNAL: {ticker} ({direction})")
 
+                    # Immediately lock signal to prevent duplicate processing (race condition fix)
+                    c.execute("UPDATE signals SET status = 'processing' WHERE id = ?", (signal_id,))
+                    conn.commit()
+                    logging.info(f"   🔒 Signal {signal_id} locked for processing")
+
                     try:
                         # --- VALIDATION ---
                         if not entry: raise ValueError("Signal missing Entry Price")
+
+                        # Validate ticker exists on Hyperliquid
+                        if ticker not in self.sz_decimals_map:
+                            raise ValueError(f"Ticker '{ticker}' not available on Hyperliquid")
+
+                        # Validate direction is allowed by bot config
+                        if not self._is_direction_allowed(direction):
+                            raise ValueError(f"Direction '{direction}' filtered (bot configured for {self.allowed_directions} only)")
+
                         entry_px = float(entry)
                         is_buy = (direction.lower() in ["long", "bullish"])
 
@@ -242,12 +274,29 @@ class HyperLiquidTopGun:
                             raise ValueError(f"Max concurrent positions reached ({current_position_count}/{self.max_concurrent_positions}). Skipping new entry.")
 
                         # --- RISK / STOP LOSS ---
-                        if not sl:
-                            dist = entry_px * self.default_sl_dist
-                            sl = (entry_px - dist) if is_buy else (entry_px + dist)
-                            logging.warning(f"   ⚠️ No SL. Using Safety Stop: {sl:.4f}")
-                        stop_px = float(sl)
-                        
+                        # Calculate stop loss price
+                        if sl:
+                            stop_px = float(sl)
+                        else:
+                            # No SL provided — use max allowed distance (10%)
+                            dist = entry_px * self.max_sl_distance
+                            stop_px = (entry_px - dist) if is_buy else (entry_px + dist)
+                            logging.warning(f"   ⚠️ No SL in signal. Using 10% safety stop: {stop_px:.4f}")
+
+                        # ENFORCE: Cap SL to max 10% distance regardless of signal
+                        sl_distance_pct = abs(entry_px - stop_px) / entry_px
+                        if sl_distance_pct > self.max_sl_distance:
+                            old_sl = stop_px
+                            dist = entry_px * self.max_sl_distance
+                            stop_px = (entry_px - dist) if is_buy else (entry_px + dist)
+                            logging.warning(f"   ⚠️ Signal SL too wide ({sl_distance_pct*100:.1f}%). Overriding: {old_sl:.4f} → {stop_px:.4f} (10%)")
+
+                        # VALIDATE: SL must be on correct side of entry
+                        if is_buy and stop_px >= entry_px:
+                            raise ValueError(f"Invalid SL for LONG: ${stop_px:.4f} must be below entry ${entry_px:.4f}")
+                        if not is_buy and stop_px <= entry_px:
+                            raise ValueError(f"Invalid SL for SHORT: ${stop_px:.4f} must be above entry ${entry_px:.4f}")
+
                         # --- SIZE CALCULATION ---
                         # (user_state already fetched above for position count check)
                         equity = float(user_state["marginSummary"]["accountValue"])
@@ -290,15 +339,36 @@ class HyperLiquidTopGun:
                         entry_oid = self._extract_order_id(result_entry)
                         logging.info(f"   📝 Entry Order ID: {entry_oid}")
 
+                        # Place stop loss — MANDATORY (no position without protection)
                         result_sl = self.exchange.order(
                             name=ticker, is_buy=not is_buy, sz=size_coin, limit_px=stop_px,
                             order_type={"trigger": {"triggerPx": stop_px, "isMarket": True, "tpsl": "sl"}},
                             reduce_only=True
                         )
-                        try: self._check_order_status(result_sl)
-                        except: pass
+
+                        try:
+                            self._check_order_status(result_sl)
+                        except Exception as sl_err:
+                            # SL failed — this is CRITICAL. Cancel entry order and abort.
+                            logging.error(f"   ❌ STOP LOSS PLACEMENT FAILED: {sl_err}")
+                            logging.error(f"   🚨 Cancelling entry order — refusing to hold position without SL")
+                            try:
+                                self.exchange.cancel(ticker, entry_oid)
+                            except:
+                                pass
+                            raise ValueError(f"SL placement failed: {sl_err}. Entry cancelled for safety.")
+
                         sl_oid = self._extract_order_id(result_sl)
-                        logging.info(f"   📝 Stop Loss Order ID: {sl_oid}") 
+                        if not sl_oid:
+                            # SL order didn't return an ID — treat as failure
+                            logging.error(f"   ❌ SL order returned no ID — cancelling entry")
+                            try:
+                                self.exchange.cancel(ticker, entry_oid)
+                            except:
+                                pass
+                            raise ValueError("SL placement returned no order ID. Entry cancelled for safety.")
+
+                        logging.info(f"   📝 Stop Loss Order ID: {sl_oid}")
 
                         # Collect all non-null targets
                         tp_oids = {}  # Store all TP order IDs
@@ -348,7 +418,7 @@ class HyperLiquidTopGun:
 
                         c.execute("""
                             UPDATE signals
-                            SET status = 'filled',
+                            SET status = 'sent',
                                 position_size_actual = ?,
                                 order_id_entry = ?,
                                 order_id_sl = ?,
@@ -370,7 +440,7 @@ class HyperLiquidTopGun:
                             signal_id
                         ))
                         conn.commit()
-                        logging.info(f"   ✅ Signal {signal_id} SUCCESS. Orders Placed.")
+                        logging.info(f"   ✅ Signal {signal_id} SUCCESS. Orders Sent (status='sent', awaiting fill).")
 
                     except Exception as e:
                         logging.error(f"   ❌ Execution Failed: {e}")
@@ -382,173 +452,7 @@ class HyperLiquidTopGun:
             except Exception as e:
                 logging.error(f"Loop Error: {e}")
                 time.sleep(5)
-        logging.info(f"[{self.bot_id}] Starting Database Poll Loop...")
-        conn = sqlite3.connect(self.db_path)
-        
-        while True:
-            try:
-                c = conn.cursor()
 
-                # ==========================================================
-                # 🛑 PRIORITY 1: CHECK FOR EXITS
-                # ==========================================================
-                query_exit = """
-                    SELECT id, symbol 
-                    FROM signals 
-                    WHERE bot_name = ? AND status = 'pending' AND signal_type = 'exit'
-                    ORDER BY created_at ASC LIMIT 1
-                """
-                c.execute(query_exit, (self.bot_id,))
-                exit_row = c.fetchone()
-
-                if exit_row:
-                    sig_id, ticker = exit_row
-                    ticker = ticker.upper().replace("USDT", "").replace("PERP", "")
-                    logging.info(f"[{self.bot_id}] 📉 EXIT SIGNAL DETECTED: {ticker}")
-                    
-                    try:
-                        # A. Cancel Open Orders (Fix for ghost limits)
-                        open_orders = self.info.frontend_open_orders(self.account.address)
-                        my_orders = [o for o in open_orders if o['coin'] == ticker]
-                        if my_orders:
-                            logging.info(f"   🧹 Cancelling {len(my_orders)} orders...")
-                            for o in my_orders:
-                                self.exchange.cancel(ticker, o['oid'])
-                        
-                        # B. Market Close
-                        logging.info(f"   💥 Closing {ticker} position...")
-                        result = self.exchange.market_close(ticker)
-                        self._check_order_status(result)
-
-                        logging.info(f"   ✅ Trade Cleaned Up.")
-                        c.execute("UPDATE signals SET status = 'executed' WHERE id = ?", (sig_id,))
-                        conn.commit()
-                        
-                    except Exception as e:
-                        logging.error(f"   ❌ Close Failed: {e}")
-                        c.execute("UPDATE signals SET status = 'failed', notes = ? WHERE id = ?", (str(e), sig_id))
-                        conn.commit()
-                        
-                    time.sleep(1)
-                    continue
-
-                # ==========================================================
-                # 🚀 PRIORITY 2: CHECK FOR ENTRIES
-                # ==========================================================
-                query_entry = """
-                    SELECT id, symbol, direction, entry_1, target_1, target_2, target_3, target_4, target_5, stop_loss, confidence_score
-                    FROM signals
-                    WHERE bot_name = ? AND status = 'pending' AND signal_type = 'entry'
-                    ORDER BY created_at ASC LIMIT 1
-                """
-                c.execute(query_entry, (self.bot_id,))
-                row = c.fetchone()
-
-                if row:
-                    signal_id, ticker, direction, entry, tp1, tp2, tp3, tp4, tp5, sl, confidence_score = row
-                    ticker = ticker.upper().replace("USDT", "").replace("PERP", "")
-                    logging.info(f"[{self.bot_id}] ENTRY SIGNAL: {ticker} ({direction})")
-
-                    try:
-                        # --- VALIDATION ---
-                        if not entry: raise ValueError("Signal missing Entry Price")
-                        entry_px = float(entry)
-                        is_buy = (direction.lower() in ["long", "bullish"])
-
-                        # --- MAX CONCURRENT POSITIONS CHECK ---
-                        user_state = self.info.user_state(self.account.address)
-                        open_positions = user_state.get("assetPositions", [])
-                        current_position_count = len([p for p in open_positions if float(p["position"]["szi"]) != 0])
-
-                        if current_position_count >= self.max_concurrent_positions:
-                            raise ValueError(f"Max concurrent positions reached ({current_position_count}/{self.max_concurrent_positions}). Skipping new entry.")
-
-                        # --- RISK / STOP LOSS ---
-                        if not sl:
-                            dist = entry_px * self.default_sl_dist
-                            sl = (entry_px - dist) if is_buy else (entry_px + dist)
-                            logging.warning(f"   ⚠️ No SL. Using Safety Stop: {sl:.4f}")
-                        stop_px = float(sl)
-                        
-                        # --- SIZE CALCULATION ---
-                        # (user_state already fetched above for position count check)
-                        equity = float(user_state["marginSummary"]["accountValue"])
-
-                        # Use signal's confidence_score for risk if available (1/5 = 1%, 5/5 = 5%)
-                        # Otherwise fall back to bot's configured risk_per_trade
-                        if confidence_score and 1 <= confidence_score <= 5:
-                            signal_risk = confidence_score * 0.01  # Maps 1-5 to 1%-5%
-                            risk_amt = equity * signal_risk
-                            logging.info(f"   📊 Signal Size: {confidence_score}/5 → Risk: {confidence_score}%")
-                        else:
-                            risk_amt = equity * self.risk_per_trade
-                        price_diff = abs(entry_px - stop_px)
-                        
-                        if price_diff == 0: raise ValueError("Invalid SL (Price == SL)")
-                        size_coin = risk_amt / price_diff
-                        
-                        # Leverage Cap
-                        if (size_coin * entry_px) > (equity * self.max_leverage):
-                            size_coin = (equity * self.max_leverage) / entry_px
-                            logging.warning(f"   ⚠️ Leverage Cap Hit. Reduced Size.")
-
-                        # --- PRECISION HANDLING (Size & Price) ---
-                        
-                        # A. Round Size (Decimal places from Metadata)
-                        sz_decimals = self.get_token_sz_decimals(ticker)
-                        size_coin = round(size_coin, sz_decimals)
-                        
-                        # B. Round Price (Strict Hyperliquid Compliance)
-                        entry_px = self.round_px(ticker, entry_px)
-                        stop_px  = self.round_px(ticker, stop_px)
-
-                        if size_coin <= 0: raise ValueError("Calculated size is 0 (Risk too small).")
-
-                        logging.info(f"   🚀 Sending Order: {ticker} | Size: {size_coin} | Price: {entry_px}")
-
-                        # --- EXECUTION ---
-                        
-                        # LIMIT ENTRY
-                        result_entry = self.exchange.order(
-                            name=ticker, is_buy=is_buy, sz=size_coin, limit_px=entry_px, 
-                            order_type={"limit": {"tif": "Gtc"}}, reduce_only=False
-                        )
-                        self._check_order_status(result_entry)
-                        
-                        # STOP LOSS
-                        result_sl = self.exchange.order(
-                            name=ticker, is_buy=not is_buy, sz=size_coin, limit_px=stop_px, 
-                            order_type={"trigger": {"triggerPx": stop_px, "isMarket": True, "tpsl": "sl"}}, 
-                            reduce_only=True
-                        )
-                        try: self._check_order_status(result_sl)
-                        except: pass 
-
-                        # TAKE PROFIT
-                        if tp:
-                            tp_px = float(tp)
-                            tp_px = self.round_px(ticker, tp_px) # Correct rounding
-                            
-                            self.exchange.order(
-                                name=ticker, is_buy=not is_buy, sz=size_coin, limit_px=tp_px, 
-                                order_type={"trigger": {"triggerPx": tp_px, "isMarket": True, "tpsl": "tp"}}, 
-                                reduce_only=True
-                            )
-
-                        c.execute("UPDATE signals SET status = 'filled', position_size_actual = ? WHERE id = ?", (size_coin, signal_id))
-                        conn.commit()
-                        logging.info(f"   ✅ Signal {signal_id} SUCCESS. Orders Placed.")
-
-                    except Exception as e:
-                        logging.error(f"   ❌ Execution Failed: {e}")
-                        c.execute("UPDATE signals SET status = 'failed', notes = ? WHERE id = ?", (str(e), signal_id))
-                        conn.commit()
-                
-                time.sleep(2)
-
-            except Exception as e:
-                logging.error(f"Loop Error: {e}")
-                time.sleep(5)
     def run_fill_monitor(self):
         """
         Continuous loop that monitors fills and triggers breakeven stop loss
@@ -630,6 +534,27 @@ class HyperLiquidTopGun:
 
         # Debug logging for fill processing
         logging.debug(f"[{self.bot_id}] Processing fill: {ticker} | OID={oid} | Dir={fill_dir} | Time={fill_time}")
+
+        # DETECT ENTRY FILLS: Upgrade 'sent' → 'filled' when limit order fills
+        if 'Open' in fill_dir:
+            cursor.execute("""
+                SELECT id FROM signals
+                WHERE bot_name = ?
+                AND order_id_entry = ?
+                AND status = 'sent'
+                AND datetime(created_at) > datetime('now', '-30 days')
+            """, (self.bot_id, oid))
+            sent_row = cursor.fetchone()
+            if sent_row:
+                sent_signal_id = sent_row[0]
+                cursor.execute("""
+                    UPDATE signals
+                    SET status = 'filled',
+                        notes = COALESCE(notes, '') || ' | Entry filled at ' || ?
+                    WHERE id = ?
+                """, (fill_time, sent_signal_id))
+                cursor.connection.commit()
+                logging.info(f"[{self.bot_id}] ✅ ENTRY FILL DETECTED: {ticker} (Signal {sent_signal_id}) → status='filled'")
 
         # TRACK POSITION CLOSURES for actual PnL calculation
         if 'Close' in fill_dir and closed_pnl != 0.0:
@@ -849,12 +774,12 @@ class HyperLiquidTopGun:
                         f"Entry: ${entry_price:.4f} | Close: ${close_price:.4f} | "
                         f"Size: {position_size} | Actual PnL: {pnl_percent:.2f}% (${closed_pnl:.2f})")
 
-            # Update entry signal with actual PnL
+            # Update entry signal with actual PnL (only if not already set, prevents duplicate notes)
             cursor.execute("""
                 UPDATE signals
                 SET pnl_percent_actual = ?,
                     notes = COALESCE(notes, '') || ' | Actual PnL: ' || ? || '%'
-                WHERE id = ?
+                WHERE id = ? AND pnl_percent_actual IS NULL
             """, (pnl_percent, f"{pnl_percent:.2f}", signal_id))
 
             # Find and update corresponding exit signal (if exists)
@@ -904,13 +829,13 @@ class HyperLiquidTopGun:
                 conn = sqlite3.connect(self.db_path, timeout=10)
                 c = conn.cursor()
 
-                # Get all positions DB thinks are open (status='filled')
+                # Get all positions DB thinks are open (status='filled' or 'sent')
                 c.execute("""
-                    SELECT id, symbol, entry_1, position_size_actual
+                    SELECT id, symbol, entry_1, position_size_actual, status, order_id_entry
                     FROM signals
                     WHERE bot_name = ?
                     AND signal_type = 'entry'
-                    AND status = 'filled'
+                    AND status IN ('filled', 'sent')
                     ORDER BY created_at DESC
                 """, (self.bot_id,))
 
@@ -932,12 +857,50 @@ class HyperLiquidTopGun:
                     if size != 0:
                         open_tickers.add(pos["position"]["coin"])
 
+                # Also check for pending (unfilled) orders on Hyperliquid
+                # This prevents false ghost detection for limit orders that haven't filled yet
+                try:
+                    open_orders = self.info.frontend_open_orders(self.account.address)
+                    pending_order_tickers = {o['coin'] for o in open_orders}
+                except Exception as e:
+                    logging.warning(f"[{self.bot_id}] Could not fetch open orders for reconciliation: {e}")
+                    pending_order_tickers = set()
+
                 # Check each DB position
-                for signal_id, ticker, entry_price, position_size in db_positions:
+                for signal_id, ticker, entry_price, position_size, db_status, entry_oid in db_positions:
                     ticker_clean = ticker.upper().replace("USDT", "").replace("PERP", "")
 
-                    # If position exists in DB but NOT on Hyperliquid, it's a ghost
+                    # CASE 1: 'sent' status - order placed but not yet confirmed filled
+                    if db_status == 'sent':
+                        if ticker_clean in open_tickers:
+                            # Position exists on Hyperliquid → order filled, upgrade to 'filled'
+                            c.execute("""
+                                UPDATE signals
+                                SET status = 'filled',
+                                    notes = COALESCE(notes, '') || ' | Entry fill confirmed by reconciliation'
+                                WHERE id = ?
+                            """, (signal_id,))
+                            logging.info(f"[{self.bot_id}] ✅ ENTRY FILLED (confirmed): {ticker_clean} (ID: {signal_id}) → status='filled'")
+                        elif ticker_clean in pending_order_tickers:
+                            # Order still pending on Hyperliquid, keep waiting
+                            logging.debug(f"[{self.bot_id}] ⏳ {ticker_clean} order still pending (ID: {signal_id})")
+                        else:
+                            # No position AND no pending order → order was cancelled or expired
+                            c.execute("""
+                                UPDATE signals
+                                SET status = 'failed',
+                                    notes = COALESCE(notes, '') || ' | Order not found on Hyperliquid (cancelled/expired)'
+                                WHERE id = ?
+                            """, (signal_id,))
+                            logging.warning(f"[{self.bot_id}] ❌ ORDER GONE: {ticker_clean} (ID: {signal_id}) - no position or pending order found")
+                        continue
+
+                    # CASE 2: 'filled' status - position should exist on Hyperliquid
                     if ticker_clean not in open_tickers:
+                        # Don't mark as ghost if there's a pending order for this ticker
+                        if ticker_clean in pending_order_tickers:
+                            logging.info(f"[{self.bot_id}] ⏳ {ticker_clean} has pending order on Hyperliquid, skipping reconciliation (ID: {signal_id})")
+                            continue
                         logging.warning(f"[{self.bot_id}] 👻 GHOST POSITION DETECTED: {ticker_clean} (ID: {signal_id})")
 
                         # Try to get PnL from recent fills
