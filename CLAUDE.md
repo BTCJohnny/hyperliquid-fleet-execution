@@ -38,8 +38,15 @@ python admin_controls.py ALL POSITIONS
 python admin_controls.py ALL ORDERS
 
 # Control commands (PAUSE, RESUME, CLOSE_ALL)
-python admin_controls.py ALL PAUSE
-python admin_controls.py "Alpha" RESUME
+python admin_controls.py ALL PAUSE          # Pause all bots (takes effect within 2 seconds)
+python admin_controls.py "Alpha" RESUME     # Resume specific bot
+python admin_controls.py "Sentient" PAUSE   # Pause specific bot (e.g., to use wallet manually)
+```
+
+**Pausing vs Removing a Bot:**
+- **PAUSE command**: Bot threads stay alive but skip signal processing. Useful for temporary stops without service restart. Resume instantly with RESUME command.
+- **Remove from fleet**: Comment out bot in `FLEET_CONFIG` in `fleet_runner.py`, then restart service. Use when permanently reassigning wallet to other purposes.
+- **Comment out private key**: Comment `PRIVATE_KEY_X` in `.env`, then restart service. Bot will be skipped with warning log.
 ```
 
 ### Analytics & Monitoring
@@ -62,6 +69,7 @@ python test/test_db_integration.py   # Full integration test (signal injection �
 python test/test_rejection.py        # Order rejection testing (precision checks)
 python test/test_controls.py         # Admin controls testing
 python test/test_parser_regex.py     # Signal parser regex validation
+python test/test_update_filter.py    # Update message filter validation (10 test cases)
 
 # Diagnostic & Monitoring Tools
 python test/reconcile_alpha_signals.py   # Signal reconciliation report (compare telegram/db/hyperliquid)
@@ -77,13 +85,18 @@ python test/view_logs.py --tail -f       # Follow all logs in real-time
 
 ### Multi-Bot Fleet System
 
-The system uses a **Fleet Runner** pattern where `fleet_runner.py` spawns multiple instances of `HyperLiquidTopGun`, each running in its own daemon thread. Each bot instance:
+The system uses a **Fleet Runner** pattern where `fleet_runner.py` spawns multiple instances of `HyperLiquidTopGun`, each running in **three daemon threads per bot**:
+
+1. **Signal Processing Thread** (`run_loop()`) - Polls database every 2 seconds for pending signals
+2. **Fill Monitor Thread** (`run_fill_monitor()`) - Monitors Hyperliquid fills for TP/SL execution and breakeven logic
+3. **Position Reconciliation Thread** (`run_position_reconciliation()`) - Syncs database state with actual Hyperliquid positions every 60 seconds
+
+Each bot instance:
 - Has its own wallet (private key)
 - Can have custom risk parameters (risk per trade, max leverage, stop loss distance)
 - Polls the SQLite database for signals matching its `bot_id`
 - Operates independently with its own logging context
-- Runs in a continuous `run_loop()` with 2-second polling interval
-- Daemon threads automatically terminate when main thread exits (Ctrl+C)
+- All daemon threads automatically terminate when main thread exits (Ctrl+C)
 
 Configuration is in `FLEET_CONFIG` in `fleet_runner.py`. The `bot_id` must match the `bot_name` column in the signals database.
 
@@ -105,12 +118,40 @@ The `HyperLiquidTopGun` class processes signals with strict priority:
 
 2. **Priority 2: Entry Signals** - Only processed if no exits are pending
    - **Check max concurrent positions limit** (safety feature)
+   - **Price staleness check** (market order fallback if >2% stale)
    - Calculate position size based on risk parameters
    - Apply leverage cap
    - Round price/size to Hyperliquid's precision requirements
-   - Place limit entry + stop loss + optional take profit
+   - Place limit/market entry + stop loss + optional take profit
 
 This prevents race conditions where an exit signal arrives while processing an entry.
+
+### Price Staleness Detection
+
+Before placing entry orders, the system compares the signal's entry price against current market price:
+
+**Logic:**
+1. Fetch current market price via `info.all_mids()`
+2. Calculate distance: `abs(entry_px - current_px) / current_px`
+3. If distance > 2%: Use **MARKET order** instead of limit order
+4. If distance ≤ 2%: Use **LIMIT order** (normal behavior)
+
+**Why This Matters:**
+- Signals may arrive with prices from hours/days ago
+- Placing a limit order at $69.36 when market is at $63.94 (8.5% away) will never fill
+- Market order fallback ensures immediate execution at current price
+- Stop loss is recalculated relative to current price to maintain proper risk
+
+**Example Log:**
+```
+⚠️ Entry price stale (8.5% from market @ $63.94). Using MARKET order.
+📊 Adjusted SL for market price: $57.55
+🚀 Sending Order: LTC | Size: 0.5 | MARKET @ 63.94
+```
+
+**Status Behavior:**
+- Market orders → status='filled' (immediate execution)
+- Limit orders → status='sent' (awaiting fill confirmation)
 
 **Max Concurrent Positions**: Before processing any entry signal, the bot checks the current number of open positions. If the count equals or exceeds `MAX_CONCURRENT_POSITIONS` (default: 3), the entry signal is skipped with an error message. This safety feature prevents overexposure.
 
@@ -124,6 +165,55 @@ This prevents race conditions where an exit signal arrives while processing an e
 6. Sleep 2 seconds
 7. Repeat
 ```
+
+### Position Reconciliation System (Auto-Healing)
+
+The fleet includes an **automatic position reconciliation system** that runs every 60 seconds per bot to detect and fix "ghost positions" (database entries marked as `status='filled'` but no longer exist on Hyperliquid).
+
+**How It Works:**
+1. Queries database for all positions with `status='filled'` (considered "open")
+2. Queries Hyperliquid API for actual open positions
+3. Compares the two states
+4. For any position in DB but NOT on Hyperliquid:
+   - Marks as `status='closed'` in database
+   - Attempts to retrieve PnL from recent fills (last 100 fills)
+   - Logs the reconciliation with actual PnL if available
+
+**Catches All Edge Cases:**
+- System restarts (Fill Monitor missed events)
+- Hyperliquid API outages (502 errors during Fill Monitor)
+- Stop losses hit automatically (Hyperliquid closes position, not the bot)
+- Take profits filled (same as above)
+- Manual position closes on Hyperliquid UI
+- Fill Monitor failures
+
+**Location:** `hyperliquid_top_gun.py` lines 856-984
+- `run_position_reconciliation()` - Main reconciliation loop
+- `_get_pnl_from_fills()` - Helper to retrieve PnL from Hyperliquid fill history
+
+**Logs:** Search for `👻 GHOST POSITION DETECTED` and `✅ Reconciled` in fleet logs.
+
+**Self-Healing:** The system automatically corrects database drift within 60 seconds, regardless of root cause. This ensures the dashboard and MAX_CONCURRENT_POSITIONS checks stay accurate.
+
+### Stale Order Auto-Cleanup (24h)
+
+The reconciliation loop also cleans up unfilled limit orders older than 24 hours:
+
+**How It Works:**
+1. Queries database for signals with `status='sent'` older than 24 hours
+2. Cancels entry order, stop loss, and any take profit orders on Hyperliquid
+3. Updates signal status to `'expired'` with note
+
+**Why This Matters:**
+- Limit orders placed at stale prices may never fill
+- Orphaned orders accumulate and clutter the order book
+- Associated SL/TP orders consume margin even if entry never fills
+
+**Location:** `hyperliquid_top_gun.py` method `_cleanup_stale_orders()`
+
+**Logs:** Search for `🕐 STALE ORDER` and `Order expired after 24h` in fleet logs.
+
+**Manual Cleanup:** Use `cleanup_stale_orders.py` for immediate cleanup without waiting for reconciliation cycle.
 
 ### Dynamic Precision System
 
@@ -159,7 +249,13 @@ If calculated leverage exceeds `MAX_LEVERAGE`, the size is reduced.
 The signal ingestion logic lives **outside this repository**:
 
 - **Signal Parser:** `/Users/johnny_main/Developer/projects/telegram_forwarder/telegram_signals_to_sqlite.py`
-  - Contains `parse_aita_signal()` function (handles batch regex)
+  - **Update Message Filter** (lines 302-350): Explicit filtering layer that rejects update/announcement messages BEFORE database insertion
+    - Detects "Signal ID - [number]" format with date keywords
+    - Filters configurable keywords: update!, achieved, alert, reminder, announcement
+    - Prevents false positives by checking for proper signal structure first
+    - Logs: `🚫 FILTERED UPDATE MESSAGE: [reason]`
+    - Configurable via `.env`: `UPDATE_FILTER_KEYWORDS`, `LOG_FILTERED_MESSAGES`
+  - Contains `parse_aita_signal()` and `parse_alpha_crypto_signal()` functions (handles batch regex)
   - Has duplicate detection with 1hr buffer
   - Managed by launchd service: `com.telegram.signals`
 - **Message Forwarder:** `/Users/johnny_main/Developer/projects/telegram_forwarder/telegram_forwarder.py`
@@ -199,8 +295,12 @@ Key columns:
 - `signal_type` - `'entry'` or `'exit'`
 - `status`:
   - `'pending'` - Waiting for processing
-  - `'filled'` - Entry executed
-  - `'executed'` - Exit executed
+  - `'processing'` - Locked for processing (prevents duplicate handling)
+  - `'sent'` - Orders placed, awaiting fill (limit orders only)
+  - `'filled'` - Entry executed (position currently open)
+  - `'closed'` - Position closed (by TP/SL hit, manual close, or reconciliation)
+  - `'executed'` - Exit executed (for exit signals)
+  - `'expired'` - Order auto-cancelled after 24h without fill
   - `'failed'` - Error occurred (see `notes` column)
 - `direction` - `'long'`, `'short'`, `'bullish'`, `'bearish'`
 - `entry_1`, `target_1`, `stop_loss` - Price levels
@@ -271,6 +371,7 @@ Edit `FLEET_CONFIG` in `fleet_runner.py` to:
 - `test_db_integration.py` - Full integration test (signal injection → processing)
 - `test_controls.py` - Tests admin control commands
 - `test_parser_regex.py` - Validates regex patterns for signal parsing
+- `test_update_filter.py` - Validates update message filtering (10 test cases covering both filtering and non-filtering scenarios)
 
 When testing, use the testnet (IS_MAINNET=False) to avoid risking real funds.
 
@@ -278,9 +379,11 @@ When testing, use the testnet (IS_MAINNET=False) to avoid risking real funds.
 
 ### Analytics
 - **`pnl_dashboard.py`** - Terminal-based PnL dashboard that queries signals.db and displays:
-  - Per-bot performance metrics
-  - Win/loss ratios
-  - Return percentages extracted from signal notes
+  - Per-bot performance metrics (closed trades only)
+  - Win/loss ratios calculated from actual Hyperliquid PnL
+  - Telegram signal provider PnL vs. actual bot execution PnL comparison
+  - Active open positions with entry prices and sizes
+  - Includes both exit signals AND auto-closed positions (status='closed')
   - Uses pandas and colorama for formatted output
 
 ### Database Maintenance
@@ -293,3 +396,15 @@ When testing, use the testnet (IS_MAINNET=False) to avoid risking real funds.
 - **`reset_id_counter.py`** - Resets SQLite auto-increment counter for clean ID sequences
 
 - **`enable_wal.py`** - Enables WAL (Write-Ahead Logging) mode for SQLite to improve concurrent access performance
+
+### Order Cleanup
+- **`cleanup_stale_orders.py`** - Immediate cleanup of unfilled orders without waiting for reconciliation:
+  ```bash
+  python cleanup_stale_orders.py              # Clean up enabled wallets
+  python cleanup_stale_orders.py --all        # Include disabled wallets
+  python cleanup_stale_orders.py --hours 48   # Custom staleness threshold
+  python cleanup_stale_orders.py --dry-run    # Report only, no changes
+  ```
+  - Cancels entry/SL/TP orders older than threshold
+  - Shows orphaned orders on Hyperliquid not tracked in database
+  - Updates signal status to 'expired'

@@ -328,13 +328,44 @@ class HyperLiquidTopGun:
 
                         if size_coin <= 0: raise ValueError("Calculated size is 0 (Risk too small).")
 
-                        logging.info(f"   🚀 Sending Order: {ticker} | Size: {size_coin} | Price: {entry_px}")
+                        # --- PRICE STALENESS CHECK ---
+                        # Fetch current market price to detect stale signals
+                        all_mids = self.info.all_mids()
+                        current_px = float(all_mids.get(ticker, 0))
+                        if current_px <= 0:
+                            raise ValueError(f"Could not fetch current price for {ticker}")
+
+                        price_distance = abs(entry_px - current_px) / current_px
+                        use_market_order = price_distance > 0.02  # 2% threshold
+
+                        if use_market_order:
+                            logging.warning(f"   ⚠️ Entry price stale ({price_distance*100:.1f}% from market @ ${current_px:.4f}). Using MARKET order.")
+                            # Recalculate stop loss if needed to maintain proper risk
+                            # Keep the same percentage distance from current price
+                            original_sl_pct = abs(entry_px - stop_px) / entry_px
+                            if is_buy:
+                                stop_px = current_px * (1 - original_sl_pct)
+                            else:
+                                stop_px = current_px * (1 + original_sl_pct)
+                            stop_px = self.round_px(ticker, stop_px)
+                            logging.info(f"   📊 Adjusted SL for market price: ${stop_px:.4f}")
+
+                        logging.info(f"   🚀 Sending Order: {ticker} | Size: {size_coin} | {'MARKET' if use_market_order else 'LIMIT'} @ {current_px if use_market_order else entry_px}")
 
                         # --- EXECUTION ---
-                        result_entry = self.exchange.order(
-                            name=ticker, is_buy=is_buy, sz=size_coin, limit_px=entry_px,
-                            order_type={"limit": {"tif": "Gtc"}}, reduce_only=False
-                        )
+                        if use_market_order:
+                            # Use market order for stale prices
+                            result_entry = self.exchange.market_open(
+                                name=ticker,
+                                is_buy=is_buy,
+                                sz=size_coin
+                            )
+                        else:
+                            # Use limit order as normal
+                            result_entry = self.exchange.order(
+                                name=ticker, is_buy=is_buy, sz=size_coin, limit_px=entry_px,
+                                order_type={"limit": {"tif": "Gtc"}}, reduce_only=False
+                            )
                         self._check_order_status(result_entry)
                         entry_oid = self._extract_order_id(result_entry)
                         logging.info(f"   📝 Entry Order ID: {entry_oid}")
@@ -416,9 +447,11 @@ class HyperLiquidTopGun:
                                     logging.error(f"   ❌ TP{tp_num} placement failed: {e}")
                                     # Continue placing remaining TPs even if one fails
 
+                        # Market orders fill immediately → 'filled', Limit orders need confirmation → 'sent'
+                        final_status = 'filled' if use_market_order else 'sent'
                         c.execute("""
                             UPDATE signals
-                            SET status = 'sent',
+                            SET status = ?,
                                 position_size_actual = ?,
                                 order_id_entry = ?,
                                 order_id_sl = ?,
@@ -429,6 +462,7 @@ class HyperLiquidTopGun:
                                 order_id_tp5 = ?
                             WHERE id = ?
                         """, (
+                            final_status,
                             size_coin,
                             entry_oid,
                             sl_oid,
@@ -440,7 +474,10 @@ class HyperLiquidTopGun:
                             signal_id
                         ))
                         conn.commit()
-                        logging.info(f"   ✅ Signal {signal_id} SUCCESS. Orders Sent (status='sent', awaiting fill).")
+                        if use_market_order:
+                            logging.info(f"   ✅ Signal {signal_id} SUCCESS. Market order filled (status='filled').")
+                        else:
+                            logging.info(f"   ✅ Signal {signal_id} SUCCESS. Limit orders sent (status='sent', awaiting fill).")
 
                     except Exception as e:
                         logging.error(f"   ❌ Execution Failed: {e}")
@@ -935,6 +972,9 @@ class HyperLiquidTopGun:
                 # Fallback: Check for missed TP1 fills that should have triggered breakeven
                 self._check_missed_breakeven(c)
 
+                # Cleanup: Cancel stale limit orders older than 24 hours
+                self._cleanup_stale_orders(c)
+
                 conn.commit()
                 conn.close()
 
@@ -1036,3 +1076,76 @@ class HyperLiquidTopGun:
                 except Exception as e:
                     logging.error(f"[{self.bot_id}] ❌ Fallback breakeven failed for {ticker} (Signal {signal_id}): {e}")
                     # Continue processing other positions
+
+    def _cleanup_stale_orders(self, cursor):
+        """
+        Cancel entry orders older than 24 hours that haven't filled.
+        This prevents orphaned limit orders from accumulating when signals
+        were placed at prices that never reached market.
+
+        Called from run_position_reconciliation() every 60 seconds.
+        """
+        STALE_THRESHOLD_HOURS = 24
+
+        # Get all 'sent' signals (orders placed, not filled) older than 24 hours
+        cursor.execute("""
+            SELECT id, symbol, order_id_entry, order_id_sl, created_at
+            FROM signals
+            WHERE bot_name = ?
+            AND status = 'sent'
+            AND datetime(created_at) < datetime('now', '-24 hours')
+        """, (self.bot_id,))
+
+        stale_signals = cursor.fetchall()
+
+        if not stale_signals:
+            return
+
+        logging.info(f"[{self.bot_id}] 🕐 Found {len(stale_signals)} stale orders (>24h unfilled)")
+
+        for signal_id, ticker, entry_oid, sl_oid, created_at in stale_signals:
+            ticker = ticker.upper().replace("USDT", "").replace("PERP", "")
+
+            logging.warning(f"[{self.bot_id}] 🕐 STALE ORDER: {ticker} (Signal {signal_id}) - Created: {created_at}")
+
+            # Cancel entry order
+            if entry_oid:
+                try:
+                    self.exchange.cancel(ticker, entry_oid)
+                    logging.info(f"   ✅ Cancelled stale entry order {entry_oid}")
+                except Exception as e:
+                    logging.warning(f"   ⚠️ Could not cancel entry order: {e}")
+
+            # Cancel associated SL order
+            if sl_oid:
+                try:
+                    self.exchange.cancel(ticker, sl_oid)
+                    logging.info(f"   ✅ Cancelled stale SL order {sl_oid}")
+                except Exception as e:
+                    logging.warning(f"   ⚠️ Could not cancel SL order: {e}")
+
+            # Cancel any TP orders
+            cursor.execute("""
+                SELECT order_id_tp1, order_id_tp2, order_id_tp3, order_id_tp4, order_id_tp5
+                FROM signals WHERE id = ?
+            """, (signal_id,))
+            tp_row = cursor.fetchone()
+            if tp_row:
+                for i, tp_oid in enumerate(tp_row, 1):
+                    if tp_oid:
+                        try:
+                            self.exchange.cancel(ticker, tp_oid)
+                            logging.info(f"   ✅ Cancelled stale TP{i} order {tp_oid}")
+                        except Exception as e:
+                            logging.warning(f"   ⚠️ Could not cancel TP{i} order: {e}")
+
+            # Mark signal as expired
+            cursor.execute("""
+                UPDATE signals
+                SET status = 'expired',
+                    notes = COALESCE(notes, '') || ' | Order expired after 24h without fill'
+                WHERE id = ?
+            """, (signal_id,))
+
+        cursor.connection.commit()
+        logging.info(f"[{self.bot_id}] ✅ Cleaned up {len(stale_signals)} stale orders")
