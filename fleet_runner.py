@@ -41,6 +41,7 @@ load_dotenv(find_dotenv())
 # - max_leverage: Maximum allowed leverage (1.0 = no leverage)
 # - default_sl_dist: Default stop loss distance if signal doesn't provide one (0.10 = 10% max)
 # - max_concurrent_positions: Maximum open positions per wallet (safety limit)
+# - max_roi_loss: Maximum ROI loss on margin (0.20 = 20%) - SL is adjusted based on leverage
 # - allowed_directions: Trade direction filter ("both", "long", or "short")
 
 FLEET_CONFIG = [
@@ -53,6 +54,7 @@ FLEET_CONFIG = [
         "max_leverage": 1.0,               # No leverage
         "default_sl_dist": 0.10,           # 10% stop loss (max allowed)
         "max_concurrent_positions": 20,    # Max 20 positions
+        "max_roi_loss": 0.20,              # 20% max ROI loss on margin
         "allowed_directions": "both"       # "both", "long", or "short"
     },
     {
@@ -64,6 +66,7 @@ FLEET_CONFIG = [
         "max_leverage": 1.0,
         "default_sl_dist": 0.10,
         "max_concurrent_positions": 20,
+        "max_roi_loss": 0.20,              # 20% max ROI loss on margin
         "allowed_directions": "both"       # "both", "long", or "short"
     },
     {
@@ -75,6 +78,7 @@ FLEET_CONFIG = [
         "max_leverage": 1.0,               # Reduced from 20.0
         "default_sl_dist": 0.10,           # 10% stop loss (max allowed)
         "max_concurrent_positions": 20,
+        "max_roi_loss": 0.20,              # 20% max ROI loss on margin
         "allowed_directions": "both"       # "both", "long", or "short"
     },
     {
@@ -86,6 +90,7 @@ FLEET_CONFIG = [
         "max_leverage": 1.0,
         "default_sl_dist": 0.10,
         "max_concurrent_positions": 20,
+        "max_roi_loss": 0.20,              # 20% max ROI loss on margin
         "allowed_directions": "both"       # "both", "long", or "short"
     }
 ]
@@ -96,7 +101,7 @@ def validate_fleet_config():
     Warns if any parameters are missing (will fall back to .env).
     """
     required_params = ['bot_id', 'private_key', 'enabled', 'risk_per_trade', 'max_leverage',
-                       'default_sl_dist', 'max_concurrent_positions', 'allowed_directions']
+                       'default_sl_dist', 'max_concurrent_positions', 'max_roi_loss', 'allowed_directions']
 
     for i, config in enumerate(FLEET_CONFIG):
         bot_id = config.get('bot_id', f'Bot #{i+1}')
@@ -137,6 +142,7 @@ def launch_fleet():
         lev = config.get("max_leverage")
         sl_dist = config.get("default_sl_dist")
         max_pos = config.get("max_concurrent_positions")
+        max_roi = config.get("max_roi_loss")
         allowed_dirs = config.get("allowed_directions")
 
         if not key:
@@ -153,7 +159,8 @@ def launch_fleet():
                 max_leverage=lev,
                 default_sl_dist=sl_dist,
                 max_concurrent_positions=max_pos,
-                allowed_directions=allowed_dirs
+                allowed_directions=allowed_dirs,
+                max_roi_loss=max_roi
             )
             
             # Create signal processing thread
@@ -174,8 +181,9 @@ def launch_fleet():
             # Formatting log for clarity
             lev_display = f"{lev}x" if lev else "Default"
             max_pos_display = f"{max_pos}" if max_pos else "Default"
+            max_roi_display = f"{max_roi*100:.0f}%" if max_roi else "20%"
             dirs_display = allowed_dirs if allowed_dirs else "both"
-            print(f"✅  LAUNCHED: {bot_id:<20} | Risk: {risk*100 if risk else 'Default'}% | Max Lev: {lev_display} | Max Pos: {max_pos_display} | Dirs: {dirs_display} | Threads: 3")
+            print(f"✅  LAUNCHED: {bot_id:<20} | Risk: {risk*100 if risk else 'Default'}% | Max Lev: {lev_display} | Max ROI Loss: {max_roi_display} | Max Pos: {max_pos_display} | Dirs: {dirs_display}")
             
         except Exception as e:
             logging.error(f"❌  FAILED to launch {bot_id}: {e}")

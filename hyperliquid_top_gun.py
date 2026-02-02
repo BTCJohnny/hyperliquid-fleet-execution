@@ -23,7 +23,7 @@ from hyperliquid.exchange import Exchange
 from hyperliquid.utils import constants
 
 class HyperLiquidTopGun:
-    def __init__(self, bot_id, private_key, risk_per_trade=None, max_leverage=None, default_sl_dist=None, max_concurrent_positions=None, allowed_directions=None):
+    def __init__(self, bot_id, private_key, risk_per_trade=None, max_leverage=None, default_sl_dist=None, max_concurrent_positions=None, allowed_directions=None, max_roi_loss=None):
         self.bot_id = bot_id
         self.db_path = "/Users/johnny_main/Developer/data/signals/signals.db"
 
@@ -42,7 +42,15 @@ class HyperLiquidTopGun:
 
         # MANDATORY SAFETY LIMIT: Maximum allowed stop loss distance (10%)
         # This is a hardcoded non-negotiable limit - signals with wider SL will be capped
+        # Used as fallback only if ROI-based calculation fails
         self.max_sl_distance = 0.10  # 10% - ensures downside protection even if bot crashes
+
+        # ROI-BASED STOP LOSS: Maximum allowed ROI loss on margin (default 20%)
+        # This is the PRIMARY SL calculation - ensures consistent % loss regardless of leverage
+        # Formula: SL_distance = max_roi_loss / effective_leverage
+        # Example: At 5x leverage with 20% max ROI loss → SL at 4% from entry
+        env_roi = os.getenv("MAX_ROI_LOSS")
+        self.max_roi_loss = max_roi_loss if max_roi_loss is not None else (float(env_roi) if env_roi else 0.20)
 
         # Direction filter: "both" (default), "long", or "short"
         self.allowed_directions = (allowed_directions or "both").lower()
@@ -53,7 +61,7 @@ class HyperLiquidTopGun:
             is_mainnet = os.getenv("IS_MAINNET") == "True"
             node_url = constants.MAINNET_API_URL if is_mainnet else constants.TESTNET_API_URL
             
-            logging.info(f"[{self.bot_id}] Connecting... (Risk: {self.risk_per_trade*100}%, Max Lev: {self.max_leverage}x, Max Pos: {self.max_concurrent_positions}, Directions: {self.allowed_directions})")
+            logging.info(f"[{self.bot_id}] Connecting... (Risk: {self.risk_per_trade*100}%, Max Lev: {self.max_leverage}x, Max Pos: {self.max_concurrent_positions}, Max ROI Loss: {self.max_roi_loss*100}%, Directions: {self.allowed_directions})")
             
             self.info = Info(node_url, skip_ws=True)
             self.exchange = Exchange(self.account, node_url)
@@ -283,14 +291,6 @@ class HyperLiquidTopGun:
                             stop_px = (entry_px - dist) if is_buy else (entry_px + dist)
                             logging.warning(f"   ⚠️ No SL in signal. Using 10% safety stop: {stop_px:.4f}")
 
-                        # ENFORCE: Cap SL to max 10% distance regardless of signal
-                        sl_distance_pct = abs(entry_px - stop_px) / entry_px
-                        if sl_distance_pct > self.max_sl_distance:
-                            old_sl = stop_px
-                            dist = entry_px * self.max_sl_distance
-                            stop_px = (entry_px - dist) if is_buy else (entry_px + dist)
-                            logging.warning(f"   ⚠️ Signal SL too wide ({sl_distance_pct*100:.1f}%). Overriding: {old_sl:.4f} → {stop_px:.4f} (10%)")
-
                         # VALIDATE: SL must be on correct side of entry
                         if is_buy and stop_px >= entry_px:
                             raise ValueError(f"Invalid SL for LONG: ${stop_px:.4f} must be below entry ${entry_px:.4f}")
@@ -318,6 +318,36 @@ class HyperLiquidTopGun:
                         if (size_coin * entry_px) > (equity * self.max_leverage):
                             size_coin = (equity * self.max_leverage) / entry_px
                             logging.warning(f"   ⚠️ Leverage Cap Hit. Reduced Size.")
+
+                        # --- ROI-BASED STOP LOSS ---
+                        # Calculate effective leverage for this position
+                        effective_leverage = (size_coin * entry_px) / equity
+
+                        # Calculate ROI-based stop loss distance
+                        # Formula: SL_distance = max_roi_loss / effective_leverage
+                        # This ensures max ROI loss on margin regardless of leverage
+                        roi_sl_distance = self.max_roi_loss / effective_leverage
+
+                        # Calculate ROI-based stop price
+                        if is_buy:
+                            roi_stop_px = entry_px * (1 - roi_sl_distance)
+                        else:
+                            roi_stop_px = entry_px * (1 + roi_sl_distance)
+
+                        # Compare signal's SL vs ROI-based SL, use the TIGHTER one (closer to entry)
+                        signal_sl_dist = abs(entry_px - stop_px) / entry_px
+
+                        if signal_sl_dist > roi_sl_distance:
+                            # Signal's SL is wider than ROI-based, use ROI-based
+                            old_sl = stop_px
+                            stop_px = roi_stop_px
+                            logging.warning(f"   ⚠️ Signal SL too wide for leverage. "
+                                          f"SL adjusted: {old_sl:.4f} → {stop_px:.4f} "
+                                          f"({roi_sl_distance*100:.1f}% distance for max {self.max_roi_loss*100:.0f}% ROI loss at {effective_leverage:.1f}x)")
+                        else:
+                            # Signal's SL is tighter, use it
+                            logging.info(f"   📊 Using signal SL: {signal_sl_dist*100:.1f}% distance "
+                                       f"(within {self.max_roi_loss*100:.0f}% ROI limit at {effective_leverage:.1f}x)")
 
                         # --- PRECISION HANDLING ---
                         sz_decimals = self.get_token_sz_decimals(ticker)

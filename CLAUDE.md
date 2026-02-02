@@ -234,15 +234,47 @@ Position sizing is based on:
 - `MAX_LEVERAGE` - Maximum allowed leverage (can be overridden per bot)
 - `DEFAULT_SL_DIST` - Default stop loss distance if signal doesn't include one
 - `MAX_CONCURRENT_POSITIONS` - Maximum open positions per wallet (default 3)
+- `MAX_ROI_LOSS` - Maximum ROI loss on margin (default 20%) - **PRIMARY SL CALCULATION**
 
 Formula: `size = (equity * risk_per_trade) / abs(entry_price - stop_loss)`
 
 If calculated leverage exceeds `MAX_LEVERAGE`, the size is reduced.
 
+**ROI-Based Stop Loss (Primary SL System):**
+
+The system uses **ROI-based stop loss calculation** to ensure consistent maximum loss regardless of leverage:
+
+```
+ROI% = price_move% × leverage
+SL_distance = max_roi_loss / effective_leverage
+
+Example at 20% max ROI loss:
+- At 3x leverage: SL at 6.67% from entry (3 × 6.67% = 20% ROI loss)
+- At 5x leverage: SL at 4% from entry (5 × 4% = 20% ROI loss)
+- At 10x leverage: SL at 2% from entry (10 × 2% = 20% ROI loss)
+```
+
+**How It Works:**
+1. Position size is calculated using the signal's SL (or default 10%)
+2. Effective leverage is calculated: `(size × entry_price) / equity`
+3. ROI-based SL distance is calculated: `max_roi_loss / effective_leverage`
+4. The **tighter** of signal's SL or ROI-based SL is used
+
+**Log Examples:**
+```
+# ROI-based SL overrides signal's wide SL:
+⚠️ Signal SL too wide for leverage. SL adjusted: 31.00 → 31.06 (2.0% distance for max 20% ROI loss at 10.0x)
+
+# Signal's SL is already tight enough:
+📊 Using signal SL: 3.5% distance (within 20% ROI limit at 5.0x)
+```
+
 **Safety Limits:**
-1. **Concurrent Position Limit**: Before processing entry signals, the bot checks current open positions. If count >= `MAX_CONCURRENT_POSITIONS`, the entry is rejected to prevent overexposure.
-2. **Leverage Cap**: Position size is reduced if calculated leverage would exceed `MAX_LEVERAGE`.
-3. **Minimum Size Check**: Orders with calculated size <= 0 are rejected.
+1. **ROI-Based SL**: Stop loss is automatically tightened based on effective leverage to cap ROI loss at `MAX_ROI_LOSS` (default 20%).
+2. **Concurrent Position Limit**: Before processing entry signals, the bot checks current open positions. If count >= `MAX_CONCURRENT_POSITIONS`, the entry is rejected to prevent overexposure.
+3. **Leverage Cap**: Position size is reduced if calculated leverage would exceed `MAX_LEVERAGE`.
+4. **Minimum Size Check**: Orders with calculated size <= 0 are rejected.
+5. **Fallback SL**: `max_sl_distance` (10%) is used only if no signal SL is provided.
 
 ### External Dependencies
 
@@ -328,6 +360,7 @@ Key columns:
 - `MAX_LEVERAGE` - Max allowed leverage (can be overridden per bot in fleet config)
 - `DEFAULT_SL_DIST` - Default stop loss distance (0.05 = 5%)
 - `MAX_CONCURRENT_POSITIONS` - Maximum open positions per wallet (default: 3) - Safety limit to prevent overexposure
+- `MAX_ROI_LOSS` - Maximum ROI loss on margin (0.20 = 20%) - Primary SL calculation based on leverage
 - `IS_MAINNET` - `False` for testnet, `True` for mainnet
 
 ### Fleet Configuration
