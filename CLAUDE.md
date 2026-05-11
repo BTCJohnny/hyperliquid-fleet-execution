@@ -236,6 +236,10 @@ Formula: `size = (equity * risk_per_trade) / abs(entry_price - stop_loss)`
 
 If calculated leverage exceeds `MAX_LEVERAGE`, the size is reduced.
 
+**Portfolio Risk Ceiling (2% hard cap):**
+
+Regardless of confidence score or bot `risk_per_trade` config, the engine clamps the per-trade risk to a hardcoded 2% of equity (`self.max_risk_per_trade` in `__init__`). A 5/5 confidence signal that would otherwise request 5% gets capped at 2%. Logged as `⚠️ Risk capped: 5.0% → 2.0%`.
+
 **ROI-Based Stop Loss (Primary SL System):**
 
 The system uses **ROI-based stop loss calculation** to ensure consistent maximum loss regardless of leverage:

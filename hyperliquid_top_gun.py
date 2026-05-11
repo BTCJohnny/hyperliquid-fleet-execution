@@ -45,6 +45,11 @@ class HyperLiquidTopGun:
         # Used as fallback only if ROI-based calculation fails
         self.max_sl_distance = 0.10  # 10% - ensures downside protection even if bot crashes
 
+        # MANDATORY SAFETY LIMIT: Maximum portfolio risk per trade (2%)
+        # Hard cap regardless of confidence score or bot risk_per_trade config.
+        # A 5/5 confidence signal would normally request 5% — this clamps it.
+        self.max_risk_per_trade = 0.02  # 2% - non-negotiable portfolio risk ceiling
+
         # ROI-BASED STOP LOSS: Maximum allowed ROI loss on margin (default 20%)
         # This is the PRIMARY SL calculation - ensures consistent % loss regardless of leverage
         # Formula: SL_distance = max_roi_loss / effective_leverage
@@ -305,10 +310,22 @@ class HyperLiquidTopGun:
                         # Otherwise fall back to bot's configured risk_per_trade
                         if confidence_score and 1 <= confidence_score <= 5:
                             signal_risk = confidence_score * 0.01  # Maps 1-5 to 1%-5%
-                            risk_amt = equity * signal_risk
-                            logging.info(f"   📊 Signal Size: {confidence_score}/5 → Risk: {confidence_score}%")
+                            source = f"Signal Size {confidence_score}/5"
                         else:
-                            risk_amt = equity * self.risk_per_trade
+                            signal_risk = self.risk_per_trade
+                            source = "bot risk_per_trade"
+
+                        # Enforce 2% portfolio-risk ceiling regardless of source
+                        if signal_risk > self.max_risk_per_trade:
+                            logging.warning(
+                                f"   ⚠️ Risk capped: {signal_risk*100:.1f}% → "
+                                f"{self.max_risk_per_trade*100:.1f}% "
+                                f"({source} exceeds {self.max_risk_per_trade*100:.0f}% portfolio max)"
+                            )
+                            signal_risk = self.max_risk_per_trade
+
+                        risk_amt = equity * signal_risk
+                        logging.info(f"   📊 Risk: {signal_risk*100:.1f}% of equity = ${risk_amt:.2f} ({source})")
                         price_diff = abs(entry_px - stop_px)
                         
                         if price_diff == 0: raise ValueError("Invalid SL (Price == SL)")
