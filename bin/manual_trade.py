@@ -65,18 +65,6 @@ DB_PATH = "/Users/johnny_main/Developer/data/signals/signals.db"
 IS_MAINNET = os.getenv("IS_MAINNET") == "True"
 BOT_NAME = "Manual Trader"
 
-# Load Manual Trader risk settings from fleet config
-MANUAL_CONFIG = get_manual_trader_config()
-
-DEFAULT_RISK_PCT = MANUAL_CONFIG['risk_per_trade']
-MAX_LEVERAGE = MANUAL_CONFIG['max_leverage']
-MAX_RISK_PCT = 0.10      # Still allow up to 10% override
-MIN_RISK_PCT = 0.001     # Still enforce minimum 0.1%
-
-# --- Global State ---
-metadata_cache = None
-sz_decimals_map = {}
-
 
 # ============================================================================
 # RISK CONFIGURATION FROM FLEET
@@ -120,6 +108,19 @@ def get_manual_trader_config():
         'default_sl_dist': float(os.getenv('DEFAULT_SL_DIST', '0.05')),
         'max_concurrent_positions': int(os.getenv('MAX_CONCURRENT_POSITIONS', '2'))
     }
+
+
+# Load Manual Trader risk settings from fleet config (call must come AFTER the def above)
+MANUAL_CONFIG = get_manual_trader_config()
+
+DEFAULT_RISK_PCT = MANUAL_CONFIG['risk_per_trade']
+MAX_LEVERAGE = MANUAL_CONFIG['max_leverage']
+MAX_RISK_PCT = 0.10      # Still allow up to 10% override
+MIN_RISK_PCT = 0.001     # Still enforce minimum 0.1%
+
+# --- Global State ---
+metadata_cache = None
+sz_decimals_map = {}
 
 
 # ============================================================================
