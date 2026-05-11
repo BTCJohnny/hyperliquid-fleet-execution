@@ -4,15 +4,22 @@ CONTEXT_FOR_LLM_INGESTION:
 SYSTEM ROLE:
 Admin Control Terminal (CLI) for the Hyperliquid Fleet.
 
+⚠️  DEPRECATION NOTICE:
+PAUSE/RESUME commands have been REMOVED in favor of config-level "enabled" flag.
+To disable a bot, edit FLEET_CONFIG in fleet_runner.py and set "enabled": False,
+then restart the fleet service. PAUSE/RESUME database commands no longer work.
+
 CAPABILITIES:
 1. READ MODE: STATUS, POSITIONS, ORDERS (Live API Data)
-2. WRITE MODE: PAUSE, RESUME, CLOSE_ALL (Database Injection)
-3. FLEET MODE: Use "ALL" as the bot name to target the entire fleet.
+2. FLEET MODE: Use "ALL" as the bot name to target the entire fleet.
 
 USAGE:
 python admin_controls.py "Apprentice" STATUS
 python admin_controls.py ALL STATUS
-python admin_controls.py ALL PAUSE
+python admin_controls.py "Alpha" POSITIONS
+python admin_controls.py ALL ORDERS
+
+To disable a bot: Edit fleet_runner.py FLEET_CONFIG, set "enabled": False, restart.
 --------------------------------------------------------------------------------
 """
 
@@ -31,9 +38,10 @@ load_dotenv(find_dotenv())
 # --- CONFIGURATION: MAP BOTS TO KEYS ---
 # 1. PRIMARY BOTS (The actual unique bot identities)
 PRIMARY_BOTS = [
-    "Apprentice Alchemist", 
-    "SentientGuard", 
-    "AlphaCryptoSignal"
+    "Apprentice Alchemist",
+    "SentientGuard",
+    "AlphaCryptoSignal",
+    "Manual Trader"
 ]
 
 # 2. FLEET KEYS (Mapping names/aliases to Private Keys)
@@ -41,11 +49,13 @@ FLEET_KEYS = {
     "Apprentice Alchemist": os.getenv("PRIVATE_KEY_ALCHEMIST"),
     "SentientGuard":        os.getenv("PRIVATE_KEY_SENTIENT"),
     "AlphaCryptoSignal":    os.getenv("PRIVATE_KEY_ALPHA"),
-    
+    "Manual Trader":        os.getenv("PRIVATE_KEY_MANUAL"),
+
     # Aliases for easier typing
     "Alpha":      os.getenv("PRIVATE_KEY_ALPHA"),
     "Apprentice": os.getenv("PRIVATE_KEY_ALCHEMIST"),
-    "Sentient":   os.getenv("PRIVATE_KEY_SENTIENT")
+    "Sentient":   os.getenv("PRIVATE_KEY_SENTIENT"),
+    "Manual":     os.getenv("PRIVATE_KEY_MANUAL")
 }
 
 # Database Path

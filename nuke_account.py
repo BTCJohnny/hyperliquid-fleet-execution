@@ -31,6 +31,7 @@ FLEET_KEYS = {
     "Apprentice Alchemist": os.getenv("PRIVATE_KEY_ALCHEMIST"),
     "SentientGuard":        os.getenv("PRIVATE_KEY_SENTIENT"),
     "AlphaCryptoSignal":    os.getenv("PRIVATE_KEY_ALPHA"),
+    "Manual Trader":        os.getenv("PRIVATE_KEY_MANUAL"),
 }
 
 IS_MAINNET = os.getenv("IS_MAINNET") == "True"

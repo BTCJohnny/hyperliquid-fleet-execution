@@ -48,7 +48,7 @@ FLEET_CONFIG = [
     {
         "bot_id": "AITA Hyperliquid",
         "private_key": os.getenv("PRIVATE_KEY_ALCHEMIST"),
-        "enabled": True,                   # On/off toggle
+        "enabled": False,                  # On/off toggle (disabled for manual trading only)
         # Conservative mainnet settings - risk controlled by signal Size (1/5 = 1%, 5/5 = 5%)
         "risk_per_trade": 0.01,           # Fallback if signal has no Size
         "max_leverage": 1.0,               # No leverage
@@ -71,8 +71,8 @@ FLEET_CONFIG = [
     },
     {
         "bot_id": "AlphaCryptoSignal",
-        "private_key": os.getenv("PRIVATE_KEY_ALPHA"),
-        "enabled": False,                  # Disabled - positions closed
+        "private_key": os.getenv("PRIVATE_KEY_SENTIENT"),  # Reassigned: Sentient wallet now runs Alpha signals
+        "enabled": True,
         # Conservative mainnet settings (reduced from 20x to 1x for safety)
         "risk_per_trade": 0.01,
         "max_leverage": 1.0,               # Reduced from 20.0
