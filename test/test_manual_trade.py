@@ -10,15 +10,14 @@ import os
 import math
 import unittest
 
-# Add parent directory to path to import manual_trade functions
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# manual_trade.py lives in ../bin/ relative to this test
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, project_root)
 
-# Import functions from manual_trade
-# Note: We need to import these as modules since manual_trade is a script
 import importlib.util
 spec = importlib.util.spec_from_file_location(
     "manual_trade",
-    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "manual_trade.py")
+    os.path.join(project_root, "bin", "manual_trade.py")
 )
 manual_trade = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(manual_trade)

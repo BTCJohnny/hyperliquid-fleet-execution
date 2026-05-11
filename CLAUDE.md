@@ -25,60 +25,59 @@ This is an automated trading execution system for Hyperliquid (Testnet/Mainnet) 
 python fleet_runner.py
 
 # Emergency kill switch (cancel all orders and close all positions)
-python nuke_account.py "Apprentice Alchemist"  # Specific bot
-python nuke_account.py ALL                      # All bots
+python bin/nuke_account.py "Apprentice Alchemist"  # Specific bot
+python bin/nuke_account.py ALL                      # All bots
 ```
 
-### Admin Controls
+### Admin Controls (read-only status views)
 ```bash
-# Query status for a specific bot or all bots
-python admin_controls.py "Apprentice" STATUS
-python admin_controls.py ALL STATUS
-python admin_controls.py ALL POSITIONS
-python admin_controls.py ALL ORDERS
-
-# Control commands (PAUSE, RESUME, CLOSE_ALL)
-python admin_controls.py ALL PAUSE          # Pause all bots (takes effect within 2 seconds)
-python admin_controls.py "Alpha" RESUME     # Resume specific bot
-python admin_controls.py "Sentient" PAUSE   # Pause specific bot (e.g., to use wallet manually)
+python bin/admin_controls.py "Apprentice" STATUS
+python bin/admin_controls.py ALL STATUS
+python bin/admin_controls.py ALL POSITIONS
+python bin/admin_controls.py ALL ORDERS
 ```
 
-**Pausing vs Removing a Bot:**
-- **PAUSE command**: Bot threads stay alive but skip signal processing. Useful for temporary stops without service restart. Resume instantly with RESUME command.
-- **Remove from fleet**: Comment out bot in `FLEET_CONFIG` in `fleet_runner.py`, then restart service. Use when permanently reassigning wallet to other purposes.
-- **Comment out private key**: Comment `PRIVATE_KEY_X` in `.env`, then restart service. Bot will be skipped with warning log.
-```
+**To disable a bot:** edit `FLEET_CONFIG` in `fleet_runner.py`, set `"enabled": False`, restart the service. There is no runtime PAUSE/RESUME — the engine does not read any control table.
+
+**To permanently remove a bot:** delete its entry from `FLEET_CONFIG` (or comment its `PRIVATE_KEY_X` in `.env`), then restart.
 
 ### Analytics & Monitoring
 ```bash
 # View PnL dashboard (terminal-based analytics)
-python pnl_dashboard.py
+python bin/pnl_dashboard.py
 
 # Database maintenance
-python nuke_database.py        # Reset signals database (DESTRUCTIVE)
-python reset_id_counter.py     # Reset SQLite ID counter
-python enable_wal.py           # Enable WAL mode for concurrent access
+python bin/nuke_database.py    # Reset signals database (DESTRUCTIVE)
+
+# Manual order cleanup (cancels unfilled orders older than 24h)
+python bin/cleanup_stale_orders.py            # Clean up enabled wallets
+python bin/cleanup_stale_orders.py --all      # Include disabled wallets
+python bin/cleanup_stale_orders.py --dry-run  # Report only, no changes
 ```
 
 ### Testing & Diagnostics
 ```bash
-# Test files are in test/ directory
-python test/connection_test.py       # Fleet connectivity check
-python test/check_db_status.py       # Database query tool (pandas-based)
+# Real unit tests (in test/)
 python test/test_db_integration.py   # Full integration test (signal injection → processing)
 python test/test_rejection.py        # Order rejection testing (precision checks)
 python test/test_controls.py         # Admin controls testing
 python test/test_parser_regex.py     # Signal parser regex validation
-python test/test_update_filter.py    # Update message filter validation (10 test cases)
+python test/test_update_filter.py    # Update message filter validation
+python test/test_manual_trade.py     # Manual trade CLI unit tests
+python test/test_max_positions.py    # Max concurrent positions safety
+python test/test_reconcile_alpha.py  # Reconciliation system unit tests
 
-# Diagnostic & Monitoring Tools
-python test/reconcile_alpha_signals.py   # Signal reconciliation report (compare telegram/db/hyperliquid)
-python test/test_reconcile_alpha.py      # Unit tests for reconciliation system
-python test/view_logs.py                 # Interactive log viewer for all system logs
-python test/view_logs.py --status        # Check status of all log files
-python test/view_logs.py --errors        # Show only errors/warnings
-python test/view_logs.py --bot Alpha     # Filter logs by bot name
-python test/view_logs.py --tail -f       # Follow all logs in real-time
+# Operational tools (in tools/)
+python tools/connection_test.py          # Fleet connectivity check
+python tools/check_db_status.py          # Database query tool (pandas-based)
+python tools/audit_config.py             # Configuration audit
+python tools/reconcile_alpha_signals.py  # Live signal reconciliation report
+python tools/trace_signal.py             # Trace a signal end-to-end through the pipeline
+python tools/view_logs.py                # Interactive log viewer
+python tools/view_logs.py --status       # Check status of all log files
+python tools/view_logs.py --errors       # Show only errors/warnings
+python tools/view_logs.py --bot Alpha    # Filter logs by bot name
+python tools/view_logs.py --tail -f      # Follow all logs in real-time
 ```
 
 ## Key Architecture Concepts
@@ -100,12 +99,12 @@ Each bot instance:
 
 Configuration is in `FLEET_CONFIG` in `fleet_runner.py`. The `bot_id` must match the `bot_name` column in the signals database.
 
-**Bot Aliases:** The `admin_controls.py` and `nuke_account.py` scripts support shortened aliases for easier CLI usage:
+**Bot Aliases:** The `bin/admin_controls.py` and `bin/nuke_account.py` scripts support shortened aliases for easier CLI usage:
 - "Apprentice" → "Apprentice Alchemist"
 - "Sentient" → "SentientGuard"
 - "Alpha" → "AlphaCryptoSignal"
 
-**Thread Safety:** Each bot instance maintains its own SQLite connection. The database uses WAL mode (if enabled via `enable_wal.py`) for better concurrent access performance.
+**Thread Safety:** Each bot instance maintains its own SQLite connection. The database is in WAL mode (`PRAGMA journal_mode=wal`) for concurrent read/write access.
 
 ### Priority-Based Signal Processing
 
@@ -157,13 +156,10 @@ Before placing entry orders, the system compares the signal's entry price agains
 
 **Bot Execution Loop Flow:**
 ```
-1. Check bot_controls table for PAUSE/RESUME/CLOSE_ALL commands
-2. If PAUSED: sleep and continue
-3. If CLOSE_ALL: execute emergency close on all positions
-4. Query for exit signals (signal_type='exit', status='pending') → Process with Priority 1
-5. Query for entry signals (signal_type='entry', status='pending') → Process with Priority 2
-6. Sleep 2 seconds
-7. Repeat
+1. Query for exit signals (signal_type='exit', status='pending') → Process with Priority 1
+2. Query for entry signals (signal_type='entry', status='pending') → Process with Priority 2
+3. Sleep 2 seconds
+4. Repeat
 ```
 
 ### Position Reconciliation System (Auto-Healing)
@@ -213,7 +209,7 @@ The reconciliation loop also cleans up unfilled limit orders older than 24 hours
 
 **Logs:** Search for `🕐 STALE ORDER` and `Order expired after 24h` in fleet logs.
 
-**Manual Cleanup:** Use `cleanup_stale_orders.py` for immediate cleanup without waiting for reconciliation cycle.
+**Manual Cleanup:** Use `bin/cleanup_stale_orders.py` for immediate cleanup without waiting for reconciliation cycle.
 
 ### Dynamic Precision System
 
@@ -341,13 +337,7 @@ Key columns:
 
 **Table:** `bot_controls`
 
-Used for admin commands (PAUSE, RESUME, CLOSE_ALL). The bot polls this table to check for control commands.
-
-Key columns:
-- `bot_name` - Target bot (or 'ALL' for fleet-wide commands)
-- `command` - Control command (`'PAUSE'`, `'RESUME'`, `'CLOSE_ALL'`)
-- `created_at` - Timestamp of command injection
-- `executed` - Boolean flag (0 = pending, 1 = completed)
+Legacy table from a removed runtime-pause feature. **The engine no longer reads it.** Disable a bot via `enabled: False` in `FLEET_CONFIG` and restart instead. The table itself can be dropped — kept only because `nuke_database.py` still clears it.
 
 ## Configuration
 
@@ -408,36 +398,23 @@ Edit `FLEET_CONFIG` in `fleet_runner.py` to:
 
 When testing, use the testnet (IS_MAINNET=False) to avoid risking real funds.
 
-## Utility Scripts
+## Operator Scripts (`bin/`)
 
 ### Analytics
-- **`pnl_dashboard.py`** - Terminal-based PnL dashboard that queries signals.db and displays:
-  - Per-bot performance metrics (closed trades only)
-  - Win/loss ratios calculated from actual Hyperliquid PnL
-  - Telegram signal provider PnL vs. actual bot execution PnL comparison
-  - Active open positions with entry prices and sizes
-  - Includes both exit signals AND auto-closed positions (status='closed')
-  - Uses pandas and colorama for formatted output
+- **`bin/pnl_dashboard.py`** — Terminal PnL dashboard. Per-bot metrics from closed trades, win/loss using actual Hyperliquid PnL, signal-provider vs. bot-execution PnL comparison, and open positions. Reads both exit signals and auto-closed positions.
 
 ### Database Maintenance
-- **`nuke_database.py`** - Destructive reset utility that:
-  - Deletes all records from `signals` and `bot_controls` tables
-  - Runs VACUUM to reclaim space
-  - Optionally deletes all log files
-  - Requires typing "NUKE" to confirm
-
-- **`reset_id_counter.py`** - Resets SQLite auto-increment counter for clean ID sequences
-
-- **`enable_wal.py`** - Enables WAL (Write-Ahead Logging) mode for SQLite to improve concurrent access performance
+- **`bin/nuke_database.py`** — Destructive reset. Deletes all rows from `signals` (and legacy `bot_controls`), VACUUMs, optionally clears logs. Requires typing "NUKE" to confirm.
 
 ### Order Cleanup
-- **`cleanup_stale_orders.py`** - Immediate cleanup of unfilled orders without waiting for reconciliation:
+- **`bin/cleanup_stale_orders.py`** — Immediate cleanup of unfilled orders without waiting for the 60s in-engine reconciliation cycle:
   ```bash
-  python cleanup_stale_orders.py              # Clean up enabled wallets
-  python cleanup_stale_orders.py --all        # Include disabled wallets
-  python cleanup_stale_orders.py --hours 48   # Custom staleness threshold
-  python cleanup_stale_orders.py --dry-run    # Report only, no changes
+  python bin/cleanup_stale_orders.py              # Enabled wallets only
+  python bin/cleanup_stale_orders.py --all        # Include disabled wallets
+  python bin/cleanup_stale_orders.py --hours 48   # Custom staleness threshold
+  python bin/cleanup_stale_orders.py --dry-run    # Report only
   ```
-  - Cancels entry/SL/TP orders older than threshold
-  - Shows orphaned orders on Hyperliquid not tracked in database
-  - Updates signal status to 'expired'
+  Cancels entry/SL/TP orders older than threshold, surfaces orphaned orders on Hyperliquid not tracked in DB, marks signals `'expired'`.
+
+### Manual Trading
+- **`bin/manual_trade.py`** — Interactive prompt-driven CLI that inserts a hand-built signal row into the database, so it gets executed by the standard fleet pipeline (same precision/risk safeguards as automated signals).

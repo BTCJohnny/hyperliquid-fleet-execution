@@ -92,8 +92,8 @@ def get_manual_trader_config():
     """
     # Import fleet config
     try:
-        # Add current directory to path to import fleet_runner
-        import_path = os.path.dirname(os.path.abspath(__file__))
+        # fleet_runner.py lives in the project root, one level above bin/
+        import_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         if import_path not in sys.path:
             sys.path.insert(0, import_path)
 

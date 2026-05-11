@@ -9,9 +9,9 @@ import sys
 import os
 from datetime import datetime
 
-# Add test directory to path for imports
-test_dir = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, test_dir)
+# reconcile_alpha_signals.py was relocated to ../tools/
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(project_root, "tools"))
 
 from reconcile_alpha_signals import (
     DatabaseCollector,
