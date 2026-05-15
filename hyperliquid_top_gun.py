@@ -17,6 +17,7 @@ import logging
 import os
 import sqlite3
 import math
+import json
 from eth_account import Account
 from hyperliquid.info import Info
 from hyperliquid.exchange import Exchange
@@ -59,6 +60,18 @@ class HyperLiquidTopGun:
 
         # Direction filter: "both" (default), "long", or "short"
         self.allowed_directions = (allowed_directions or "both").lower()
+
+        # Dedupe of fills already handled by _process_fill, persisted across restarts
+        # so the post-restart first scan doesn't re-emit close/TP detections for
+        # fills processed in a previous lifetime.
+        safe_id = bot_id.replace(" ", "_").replace("/", "_")
+        self._dedupe_path = f"/Users/johnny_main/Developer/data/signals/dedupe_{safe_id}.json"
+        try:
+            with open(self._dedupe_path) as f:
+                self._processed_fill_keys = {tuple(k) for k in json.load(f)}
+            logging.info(f"[{self.bot_id}] Loaded {len(self._processed_fill_keys)} processed fill keys from disk.")
+        except (FileNotFoundError, json.JSONDecodeError, ValueError):
+            self._processed_fill_keys = set()
 
         # --- CONNECTION & METADATA ---
         try:
@@ -616,6 +629,20 @@ class HyperLiquidTopGun:
         fill_dir = fill.get('dir', '')
         closed_pnl = float(fill.get('closedPnl', 0.0))
 
+        # Dedupe: a single fill is uniquely identified by (oid, time_ms).
+        # The 5-min periodic full-scan resets last_fill_check=0 and re-walks all
+        # fills; without this guard, every TP/close fill re-emits its log lines
+        # and re-appends to the signal's notes column every cycle.
+        fill_key = (oid, fill['time'])
+        if fill_key in self._processed_fill_keys:
+            return
+        self._processed_fill_keys.add(fill_key)
+        try:
+            with open(self._dedupe_path, "w") as f:
+                json.dump(list(self._processed_fill_keys), f)
+        except OSError as e:
+            logging.warning(f"[{self.bot_id}] Could not persist dedupe state: {e}")
+
         # Debug logging for fill processing
         logging.debug(f"[{self.bot_id}] Processing fill: {ticker} | OID={oid} | Dir={fill_dir} | Time={fill_time}")
 
@@ -839,7 +866,7 @@ class HyperLiquidTopGun:
             entry_row = cursor.fetchone()
 
             if not entry_row:
-                logging.warning(f"[{self.bot_id}] Position closed for {ticker} but no entry signal found")
+                logging.debug(f"[{self.bot_id}] Close fill for {ticker} has no matching entry signal — not this bot's trade")
                 return
 
             signal_id, entry_price, position_size = entry_row
