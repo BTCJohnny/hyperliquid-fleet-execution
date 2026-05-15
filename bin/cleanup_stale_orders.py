@@ -28,29 +28,9 @@ load_dotenv(find_dotenv())
 # Database path (same as fleet runner)
 DB_PATH = "/Users/johnny_main/Developer/data/signals/signals.db"
 
-# Fleet configuration (mirror of fleet_runner.py)
-FLEET_CONFIG = [
-    {
-        "bot_id": "AITA Hyperliquid",
-        "private_key": os.getenv("PRIVATE_KEY_ALCHEMIST"),
-        "enabled": True,
-    },
-    {
-        "bot_id": "SentientGuard",
-        "private_key": os.getenv("PRIVATE_KEY_SENTIENT"),
-        "enabled": False,
-    },
-    {
-        "bot_id": "AlphaCryptoSignal",
-        "private_key": os.getenv("PRIVATE_KEY_ALPHA"),
-        "enabled": False,
-    },
-    {
-        "bot_id": "Manual Trader",
-        "private_key": os.getenv("PRIVATE_KEY_MANUAL"),
-        "enabled": False,
-    }
-]
+# Pull FLEET_CONFIG from fleet_runner so wallet/enabled mappings can't drift.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from fleet_runner import FLEET_CONFIG  # noqa: E402
 
 
 def get_hl_connection(private_key):

@@ -66,6 +66,8 @@ class HyperLiquidTopGun:
         # fills processed in a previous lifetime.
         safe_id = bot_id.replace(" ", "_").replace("/", "_")
         self._dedupe_path = f"/Users/johnny_main/Developer/data/signals/dedupe_{safe_id}.json"
+        self._heartbeat_dir = "/Users/johnny_main/Developer/data/signals"
+        self._safe_bot_id = safe_id
         try:
             with open(self._dedupe_path) as f:
                 self._processed_fill_keys = {tuple(k) for k in json.load(f)}
@@ -76,26 +78,67 @@ class HyperLiquidTopGun:
         # --- CONNECTION & METADATA ---
         try:
             self.account = Account.from_key(private_key)
-            is_mainnet = os.getenv("IS_MAINNET") == "True"
+            # Treat anything that isn't an explicit truthy string as testnet (safer failure mode).
+            raw_mainnet = (os.getenv("IS_MAINNET") or "").strip().lower()
+            is_mainnet = raw_mainnet in ("true", "1", "yes")
             node_url = constants.MAINNET_API_URL if is_mainnet else constants.TESTNET_API_URL
-            
+            self.network = "MAINNET" if is_mainnet else "TESTNET"
+
+            logging.warning(
+                f"[{self.bot_id}] 🌐 NETWORK: {self.network} ({node_url}) — "
+                f"Wallet: {self.account.address}"
+            )
             logging.info(f"[{self.bot_id}] Connecting... (Risk: {self.risk_per_trade*100}%, Max Lev: {self.max_leverage}x, Max Pos: {self.max_concurrent_positions}, Max ROI Loss: {self.max_roi_loss*100}%, Directions: {self.allowed_directions})")
-            
+
             self.info = Info(node_url, skip_ws=True)
             self.exchange = Exchange(self.account, node_url)
-            
+
             # --- METADATA CACHE (CRITICAL FOR PRECISION) ---
             self.meta = self.info.meta()
             self.sz_decimals_map = {
-                asset['name']: asset['szDecimals'] 
+                asset['name']: asset['szDecimals']
                 for asset in self.meta['universe']
             }
             logging.info(f"[{self.bot_id}] Loaded precision data for {len(self.sz_decimals_map)} assets.")
             logging.info(f"[{self.bot_id}] Online. Wallet: {self.account.address[:6]}...")
-            
+
+            # Recover signals stuck in 'processing' from a previous crash/restart.
+            # The signal loop only picks up 'pending', so a row left in 'processing'
+            # is orphaned forever. The reconciliation thread will catch any
+            # actually-open position; here we just unjam the DB.
+            try:
+                rec = sqlite3.connect(self.db_path, timeout=10)
+                rc = rec.cursor()
+                rc.execute(
+                    "UPDATE signals SET status = 'failed', "
+                    "notes = COALESCE(notes, '') || ' | Reset on bot startup (was processing)' "
+                    "WHERE bot_name = ? AND status = 'processing'",
+                    (self.bot_id,)
+                )
+                if rc.rowcount > 0:
+                    logging.warning(
+                        f"[{self.bot_id}] 🔧 Recovered {rc.rowcount} signal(s) "
+                        f"stuck in 'processing' from a previous run."
+                    )
+                rec.commit()
+                rec.close()
+            except Exception as rec_err:
+                logging.error(f"[{self.bot_id}] Startup recovery failed: {rec_err}")
+
         except Exception as e:
             logging.error(f"[{self.bot_id}] ❌ Init Failed: {e}")
             raise e
+
+    def _heartbeat(self, thread_name):
+        """Write a timestamp to disk so health_check.py can detect thread death.
+        The fleet process can keep logging from one thread while another silently dies;
+        the launchd log-mtime check won't catch that — per-thread heartbeats do."""
+        path = f"{self._heartbeat_dir}/heartbeat_{self._safe_bot_id}_{thread_name}.txt"
+        try:
+            with open(path, "w") as f:
+                f.write(str(time.time()))
+        except Exception:
+            pass  # never let heartbeat I/O kill the thread
 
     def get_token_sz_decimals(self, ticker):
         """Returns the allowed SIZE decimals for a token (e.g. 3)."""
@@ -188,10 +231,11 @@ class HyperLiquidTopGun:
 
     def run_loop(self):
         logging.info(f"[{self.bot_id}] Starting Database Poll Loop...")
-        conn = sqlite3.connect(self.db_path)
-        
+        conn = sqlite3.connect(self.db_path, timeout=10)
+
         while True:
             try:
+                self._heartbeat("signal")
                 c = conn.cursor()
 
                 # ==========================================================
@@ -292,16 +336,70 @@ class HyperLiquidTopGun:
                         is_buy = (direction.lower() in ["long", "bullish"])
 
                         # --- MAX CONCURRENT POSITIONS CHECK ---
+                        # Count both: live HL positions AND DB rows already in-flight for this bot.
+                        # The DB count closes the TOCTOU race where two signals lock to
+                        # 'processing' within the same poll window and both pass a live-HL
+                        # check before either order has registered on the exchange.
+                        # We exclude the current signal (signal_id) since it's already locked.
                         user_state = self.info.user_state(self.account.address)
                         open_positions = user_state.get("assetPositions", [])
-                        current_position_count = len([p for p in open_positions if float(p["position"]["szi"]) != 0])
+                        hl_count = len([p for p in open_positions if float(p["position"]["szi"]) != 0])
+
+                        c.execute(
+                            "SELECT COUNT(*) FROM signals "
+                            "WHERE bot_name = ? AND id != ? "
+                            "AND status IN ('processing', 'sent', 'filled')",
+                            (self.bot_id, signal_id)
+                        )
+                        db_inflight = c.fetchone()[0]
+
+                        current_position_count = max(hl_count, db_inflight)
 
                         if current_position_count >= self.max_concurrent_positions:
-                            raise ValueError(f"Max concurrent positions reached ({current_position_count}/{self.max_concurrent_positions}). Skipping new entry.")
+                            raise ValueError(
+                                f"Max concurrent positions reached "
+                                f"(HL={hl_count}, DB-inflight={db_inflight}, "
+                                f"limit={self.max_concurrent_positions}). Skipping new entry."
+                            )
+
+                        # --- PRICE STALENESS RE-ANCHOR ---
+                        # If the signal's entry price is far from current market, re-anchor
+                        # to the current price and place a LIMIT there. No market orders —
+                        # if price runs further away, the limit simply won't fill (correct
+                        # outcome for a stale signal; 24h cleanup handles non-fills).
+                        all_mids = self.info.all_mids()
+                        current_px = float(all_mids.get(ticker, 0))
+                        if current_px <= 0:
+                            raise ValueError(f"Could not fetch current price for {ticker}")
+
+                        signal_entry_px = entry_px  # remember pre-re-anchor for TP scaling
+                        price_distance = abs(entry_px - current_px) / current_px
+                        if price_distance > 0.02:
+                            # Preserve the signal's intended SL distance (as a % of signal entry),
+                            # and reapply it to the current price below.
+                            if sl:
+                                sl_pct_override = abs(entry_px - float(sl)) / entry_px
+                            else:
+                                sl_pct_override = self.max_sl_distance
+                            logging.warning(
+                                f"   ⚠️ Entry price stale ({price_distance*100:.1f}% from market @ ${current_px:.4f}). "
+                                f"Re-anchoring entry to current price (limit only — no market fallback)."
+                            )
+                            entry_px = current_px
+                        else:
+                            sl_pct_override = None
+                        tp_scale = entry_px / signal_entry_px  # 1.0 unless re-anchored
 
                         # --- RISK / STOP LOSS ---
                         # Calculate stop loss price
-                        if sl:
+                        if sl_pct_override is not None:
+                            # Stale-signal path: SL derived from re-anchored entry.
+                            if is_buy:
+                                stop_px = entry_px * (1 - sl_pct_override)
+                            else:
+                                stop_px = entry_px * (1 + sl_pct_override)
+                            logging.info(f"   📊 Re-anchored SL: {stop_px:.4f} ({sl_pct_override*100:.1f}% from current price)")
+                        elif sl:
                             stop_px = float(sl)
                         else:
                             # No SL provided — use max allowed distance (10%)
@@ -388,44 +486,17 @@ class HyperLiquidTopGun:
 
                         if size_coin <= 0: raise ValueError("Calculated size is 0 (Risk too small).")
 
-                        # --- PRICE STALENESS CHECK ---
-                        # Fetch current market price to detect stale signals
-                        all_mids = self.info.all_mids()
-                        current_px = float(all_mids.get(ticker, 0))
-                        if current_px <= 0:
-                            raise ValueError(f"Could not fetch current price for {ticker}")
-
-                        price_distance = abs(entry_px - current_px) / current_px
-                        use_market_order = price_distance > 0.02  # 2% threshold
-
-                        if use_market_order:
-                            logging.warning(f"   ⚠️ Entry price stale ({price_distance*100:.1f}% from market @ ${current_px:.4f}). Using MARKET order.")
-                            # Recalculate stop loss if needed to maintain proper risk
-                            # Keep the same percentage distance from current price
-                            original_sl_pct = abs(entry_px - stop_px) / entry_px
-                            if is_buy:
-                                stop_px = current_px * (1 - original_sl_pct)
-                            else:
-                                stop_px = current_px * (1 + original_sl_pct)
-                            stop_px = self.round_px(ticker, stop_px)
-                            logging.info(f"   📊 Adjusted SL for market price: ${stop_px:.4f}")
-
-                        logging.info(f"   🚀 Sending Order: {ticker} | Size: {size_coin} | {'MARKET' if use_market_order else 'LIMIT'} @ {current_px if use_market_order else entry_px}")
+                        logging.info(f"   🚀 Sending Order: {ticker} | Size: {size_coin} | LIMIT @ {entry_px}")
 
                         # --- EXECUTION ---
-                        if use_market_order:
-                            # Use market order for stale prices
-                            result_entry = self.exchange.market_open(
-                                name=ticker,
-                                is_buy=is_buy,
-                                sz=size_coin
-                            )
-                        else:
-                            # Use limit order as normal
-                            result_entry = self.exchange.order(
-                                name=ticker, is_buy=is_buy, sz=size_coin, limit_px=entry_px,
-                                order_type={"limit": {"tif": "Gtc"}}, reduce_only=False
-                            )
+                        # Always use a resting limit. Market orders were removed:
+                        # the SDK's 5% slippage cap is too loose at scale, and a filled
+                        # market entry leaves a naked position if SL placement then
+                        # fails. A resting limit can be safely cancelled on SL failure.
+                        result_entry = self.exchange.order(
+                            name=ticker, is_buy=is_buy, sz=size_coin, limit_px=entry_px,
+                            order_type={"limit": {"tif": "Gtc"}}, reduce_only=False
+                        )
                         self._check_order_status(result_entry)
                         entry_oid = self._extract_order_id(result_entry)
                         logging.info(f"   📝 Entry Order ID: {entry_oid}")
@@ -475,7 +546,11 @@ class HyperLiquidTopGun:
                             logging.info(f"   🎯 Placing {num_targets} TP orders with equal distribution ({100/num_targets:.1f}% each)")
 
                             for idx, (tp_num, target_price) in enumerate(targets):
-                                tp_px = self.round_px(ticker, float(target_price))
+                                # Scale TP proportionally if entry was re-anchored — preserves
+                                # the signal author's intended % gain rather than firing at a
+                                # stale absolute price (which on a stale signal would often
+                                # already be on the wrong side of the new entry).
+                                tp_px = self.round_px(ticker, float(target_price) * tp_scale)
 
                                 # Calculate partial size for this TP
                                 partial_sz = round(partial_size, sz_decimals)
@@ -507,11 +582,10 @@ class HyperLiquidTopGun:
                                     logging.error(f"   ❌ TP{tp_num} placement failed: {e}")
                                     # Continue placing remaining TPs even if one fails
 
-                        # Market orders fill immediately → 'filled', Limit orders need confirmation → 'sent'
-                        final_status = 'filled' if use_market_order else 'sent'
+                        # Limit-only entry — fill is confirmed asynchronously by fill monitor / reconciliation.
                         c.execute("""
                             UPDATE signals
-                            SET status = ?,
+                            SET status = 'sent',
                                 position_size_actual = ?,
                                 order_id_entry = ?,
                                 order_id_sl = ?,
@@ -522,7 +596,6 @@ class HyperLiquidTopGun:
                                 order_id_tp5 = ?
                             WHERE id = ?
                         """, (
-                            final_status,
                             size_coin,
                             entry_oid,
                             sl_oid,
@@ -534,10 +607,7 @@ class HyperLiquidTopGun:
                             signal_id
                         ))
                         conn.commit()
-                        if use_market_order:
-                            logging.info(f"   ✅ Signal {signal_id} SUCCESS. Market order filled (status='filled').")
-                        else:
-                            logging.info(f"   ✅ Signal {signal_id} SUCCESS. Limit orders sent (status='sent', awaiting fill).")
+                        logging.info(f"   ✅ Signal {signal_id} SUCCESS. Limit orders sent (status='sent', awaiting fill).")
 
                     except Exception as e:
                         logging.error(f"   ❌ Execution Failed: {e}")
@@ -568,6 +638,7 @@ class HyperLiquidTopGun:
 
         while True:
             try:
+                self._heartbeat("fill_monitor")
                 # Periodic full scan to catch missed fills
                 if time.time() - last_full_scan > full_scan_interval:
                     logging.info(f"[{self.bot_id}] 🔍 Fill Monitor: Running periodic full scan for missed fills")
@@ -937,6 +1008,7 @@ class HyperLiquidTopGun:
 
         while True:
             try:
+                self._heartbeat("reconcile")
                 conn = sqlite3.connect(self.db_path, timeout=10)
                 c = conn.cursor()
 

@@ -26,13 +26,13 @@ from hyperliquid.utils import constants
 # --- Load Environment ---
 load_dotenv(find_dotenv())
 
-# --- CONFIGURATION: FLEET KEYS ---
-FLEET_KEYS = {
-    "Apprentice Alchemist": os.getenv("PRIVATE_KEY_ALCHEMIST"),
-    "SentientGuard":        os.getenv("PRIVATE_KEY_SENTIENT"),
-    "AlphaCryptoSignal":    os.getenv("PRIVATE_KEY_ALPHA"),
-    "Manual Trader":        os.getenv("PRIVATE_KEY_MANUAL"),
-}
+# Pull the live wallet map from fleet_runner so the kill switch can NEVER drift
+# away from what's actually trading. A stale local copy of this dict caused a
+# pre-launch finding where AlphaCryptoSignal pointed at the wrong wallet.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from fleet_runner import FLEET_CONFIG  # noqa: E402
+
+FLEET_KEYS = {bot["bot_id"]: bot["private_key"] for bot in FLEET_CONFIG}
 
 IS_MAINNET = os.getenv("IS_MAINNET") == "True"
 BASE_URL = constants.MAINNET_API_URL if IS_MAINNET else constants.TESTNET_API_URL
