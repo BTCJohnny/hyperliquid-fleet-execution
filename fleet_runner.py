@@ -77,7 +77,7 @@ FLEET_CONFIG = [
         "risk_per_trade": 0.01,
         "max_leverage": 1.0,               # Reduced from 20.0
         "default_sl_dist": 0.10,           # 10% stop loss (max allowed)
-        "max_concurrent_positions": 20,
+        "max_concurrent_positions": 5,
         "max_roi_loss": 0.20,              # 20% max ROI loss on margin
         "allowed_directions": "both"       # "both", "long", or "short"
     },
