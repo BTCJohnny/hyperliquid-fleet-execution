@@ -732,9 +732,10 @@ class HyperLiquidTopGun:
                 cursor.execute("""
                     UPDATE signals
                     SET status = 'filled',
+                        entry_filled_at = ?,
                         notes = COALESCE(notes, '') || ' | Entry filled at ' || ?
                     WHERE id = ?
-                """, (fill_time, sent_signal_id))
+                """, (fill_time, fill_time, sent_signal_id))
                 cursor.connection.commit()
                 logging.info(f"[{self.bot_id}] ✅ ENTRY FILL DETECTED: {ticker} (Signal {sent_signal_id}) → status='filled'")
 
@@ -914,17 +915,17 @@ class HyperLiquidTopGun:
         from datetime import datetime
 
         try:
-            closed_pnl = float(fill.get('closedPnl', 0.0))
+            closed_pnl_this_fill = float(fill.get('closedPnl', 0.0))
             close_price = float(fill.get('px', 0.0))
             close_size = float(fill.get('sz', 0.0))
             fill_time = datetime.fromtimestamp(fill['time'] / 1000).isoformat()
 
-            if closed_pnl == 0.0 or close_size == 0.0:
+            if closed_pnl_this_fill == 0.0 or close_size == 0.0:
                 return  # No meaningful PnL to track
 
             # Find the most recent filled entry for this ticker
             cursor.execute("""
-                SELECT id, entry_1, position_size_actual
+                SELECT id, entry_1, position_size_actual, entry_filled_at
                 FROM signals
                 WHERE bot_name = ?
                 AND symbol = ?
@@ -940,28 +941,35 @@ class HyperLiquidTopGun:
                 logging.debug(f"[{self.bot_id}] Close fill for {ticker} has no matching entry signal — not this bot's trade")
                 return
 
-            signal_id, entry_price, position_size = entry_row
+            signal_id, entry_price, position_size, entry_filled_at = entry_row
             entry_price = float(entry_price)
             position_size = float(position_size)
 
-            # Calculate PnL percentage
-            # PnL% = (closedPnl / (entry_price * position_size)) * 100
-            position_value = entry_price * position_size
-            if position_value > 0:
-                pnl_percent = (closed_pnl / position_value) * 100
+            # Re-sum from authoritative source: every close fill since entry
+            # (TP1+TP2+TP3+BE/SL all contribute). Earlier behavior recorded
+            # only the first close fill's PnL, locked by `IS NULL`, so trades
+            # exited in legs ended up under-reported.
+            pnl_info = self._get_pnl_from_fills(ticker, entry_price, position_size, entry_filled_at)
+            if pnl_info is None:
+                # Fallback: just this fill's contribution
+                position_value = entry_price * position_size
+                pnl_percent = (closed_pnl_this_fill / position_value) * 100 if position_value > 0 else 0.0
+                net_pnl = closed_pnl_this_fill
             else:
-                pnl_percent = 0.0
+                pnl_percent, net_pnl, _ = pnl_info
 
-            logging.info(f"[{self.bot_id}] 💰 POSITION CLOSED: {ticker} | "
-                        f"Entry: ${entry_price:.4f} | Close: ${close_price:.4f} | "
-                        f"Size: {position_size} | Actual PnL: {pnl_percent:.2f}% (${closed_pnl:.2f})")
+            logging.info(f"[{self.bot_id}] 💰 POSITION CLOSE FILL: {ticker} | "
+                        f"Entry: ${entry_price:.4f} | This fill close: ${close_price:.4f} | "
+                        f"Cumulative PnL: {pnl_percent:.2f}% (${net_pnl:.2f}) "
+                        f"after this leg")
 
-            # Update entry signal with actual PnL (only if not already set, prevents duplicate notes)
+            # Overwrite (not gate-on-NULL) so each subsequent close fill keeps
+            # the cumulative figure accurate.
             cursor.execute("""
                 UPDATE signals
                 SET pnl_percent_actual = ?,
-                    notes = COALESCE(notes, '') || ' | Actual PnL: ' || ? || '%'
-                WHERE id = ? AND pnl_percent_actual IS NULL
+                    notes = COALESCE(notes, '') || ' | Cumulative PnL after close fill: ' || ? || '%'
+                WHERE id = ?
             """, (pnl_percent, f"{pnl_percent:.2f}", signal_id))
 
             # Find and update corresponding exit signal (if exists)
@@ -1004,6 +1012,8 @@ class HyperLiquidTopGun:
         - Take profits filled
         - Manual position closes on Hyperliquid
         """
+        from datetime import datetime
+
         logging.info(f"[{self.bot_id}] Starting Position Reconciliation Loop...")
 
         while True:
@@ -1014,7 +1024,7 @@ class HyperLiquidTopGun:
 
                 # Get all positions DB thinks are open (status='filled' or 'sent')
                 c.execute("""
-                    SELECT id, symbol, entry_1, position_size_actual, status, order_id_entry
+                    SELECT id, symbol, entry_1, position_size_actual, status, order_id_entry, entry_filled_at
                     FROM signals
                     WHERE bot_name = ?
                     AND signal_type = 'entry'
@@ -1050,19 +1060,23 @@ class HyperLiquidTopGun:
                     pending_order_tickers = set()
 
                 # Check each DB position
-                for signal_id, ticker, entry_price, position_size, db_status, entry_oid in db_positions:
+                for signal_id, ticker, entry_price, position_size, db_status, entry_oid, entry_filled_at in db_positions:
                     ticker_clean = ticker.upper().replace("USDT", "").replace("PERP", "")
 
                     # CASE 1: 'sent' status - order placed but not yet confirmed filled
                     if db_status == 'sent':
                         if ticker_clean in open_tickers:
                             # Position exists on Hyperliquid → order filled, upgrade to 'filled'
+                            # Reconciliation can't observe the precise fill timestamp,
+                            # so use 'now' as a conservative floor for downstream PnL filtering.
+                            now_iso = datetime.now().isoformat()
                             c.execute("""
                                 UPDATE signals
                                 SET status = 'filled',
+                                    entry_filled_at = COALESCE(entry_filled_at, ?),
                                     notes = COALESCE(notes, '') || ' | Entry fill confirmed by reconciliation'
                                 WHERE id = ?
-                            """, (signal_id,))
+                            """, (now_iso, signal_id,))
                             logging.info(f"[{self.bot_id}] ✅ ENTRY FILLED (confirmed): {ticker_clean} (ID: {signal_id}) → status='filled'")
                         elif ticker_clean in pending_order_tickers:
                             # Order still pending on Hyperliquid, keep waiting
@@ -1086,8 +1100,8 @@ class HyperLiquidTopGun:
                             continue
                         logging.warning(f"[{self.bot_id}] 👻 GHOST POSITION DETECTED: {ticker_clean} (ID: {signal_id})")
 
-                        # Try to get PnL from recent fills
-                        pnl_info = self._get_pnl_from_fills(ticker_clean, entry_price, position_size)
+                        # Sum all close fills for this position since entry (TP1+TP2+TP3+BE/SL)
+                        pnl_info = self._get_pnl_from_fills(ticker_clean, entry_price, position_size, entry_filled_at)
 
                         if pnl_info:
                             pnl_percent, closed_pnl, close_price = pnl_info
@@ -1130,35 +1144,77 @@ class HyperLiquidTopGun:
                 logging.error(f"[{self.bot_id}] Position Reconciliation Error: {e}")
                 time.sleep(60)
 
-    def _get_pnl_from_fills(self, ticker, entry_price, position_size):
+    def _get_pnl_from_fills(self, ticker, entry_price, position_size, entry_filled_at=None):
         """
-        Try to retrieve PnL data from recent fills for a closed position.
+        Sum closedPnl (net of fees) across ALL close fills for this ticker
+        since the entry was filled. Previously this returned only the first
+        matching close fill, so positions exited via multiple TPs + BE/SL
+        recorded just the first leg's PnL.
 
         Args:
             ticker: Symbol (e.g., 'ETH')
             entry_price: Entry price from database
             position_size: Position size from database
+            entry_filled_at: ISO timestamp string of entry fill (filters fills
+                to those after this time, so we don't conflate with prior
+                trades on the same ticker). If None, falls back to the most
+                recent contiguous block of close fills.
 
         Returns:
-            Tuple of (pnl_percent, closed_pnl, close_price) or None if not found
+            Tuple of (pnl_percent, net_pnl, avg_close_price) or None.
+            net_pnl = sum(closedPnl) - sum(fee).
+            pnl_percent is relative to the position notional at entry.
         """
         try:
+            from datetime import datetime
+
             fills = self.info.user_fills(self.account.address)
 
-            # Look for closing fills for this ticker (most recent 100 fills)
-            for fill in reversed(fills[-100:]):
-                if fill['coin'] == ticker and 'Close' in fill.get('dir', ''):
-                    closed_pnl = float(fill.get('closedPnl', 0.0))
-                    close_price = float(fill.get('px', 0.0))
+            # Determine the timestamp floor (ms) for relevant fills.
+            cutoff_ms = 0
+            if entry_filled_at:
+                try:
+                    # Subtract 60s of slack to absorb any clock/TZ skew between
+                    # the DB write and the exchange fill timestamp.
+                    cutoff_ms = int(datetime.fromisoformat(entry_filled_at).timestamp() * 1000) - 60_000
+                except Exception:
+                    cutoff_ms = 0
 
-                    if closed_pnl != 0.0:
-                        # Calculate PnL percentage
-                        position_value = float(entry_price) * float(position_size)
-                        if position_value > 0:
-                            pnl_percent = (closed_pnl / position_value) * 100
-                            return (pnl_percent, closed_pnl, close_price)
+            gross_pnl = 0.0
+            total_fees = 0.0
+            sized_price_sum = 0.0
+            total_close_size = 0.0
+            n_close_fills = 0
 
-            return None
+            for fill in fills:
+                if fill.get('coin') != ticker:
+                    continue
+                if 'Close' not in fill.get('dir', ''):
+                    continue
+                if cutoff_ms and fill.get('time', 0) < cutoff_ms:
+                    continue
+                gross_pnl += float(fill.get('closedPnl', 0.0))
+                total_fees += float(fill.get('fee', 0.0))
+                px = float(fill.get('px', 0.0))
+                sz = float(fill.get('sz', 0.0))
+                sized_price_sum += px * sz
+                total_close_size += sz
+                n_close_fills += 1
+
+            if n_close_fills == 0 or total_close_size == 0:
+                return None
+
+            net_pnl = gross_pnl - total_fees
+            avg_close_price = sized_price_sum / total_close_size
+            position_value = float(entry_price) * float(position_size)
+            pnl_percent = (net_pnl / position_value) * 100 if position_value > 0 else 0.0
+
+            logging.debug(
+                f"[{self.bot_id}] PnL from {n_close_fills} close fill(s) for {ticker}: "
+                f"gross=${gross_pnl:.4f} fees=${total_fees:.4f} net=${net_pnl:.4f} "
+                f"({pnl_percent:.2f}%)"
+            )
+            return (pnl_percent, net_pnl, avg_close_price)
 
         except Exception as e:
             logging.warning(f"[{self.bot_id}] Could not fetch PnL from fills for {ticker}: {e}")
